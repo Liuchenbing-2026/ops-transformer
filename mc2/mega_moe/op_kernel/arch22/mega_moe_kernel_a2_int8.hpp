@@ -306,6 +306,48 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
     }
 
+    // Copy packed rows and separate their scales with two drained UB buffers.
+    // GM strides are bytes; UB strides are 32-byte blocks, including automatic padding.
+    template <typename T>
+    CATLASS_DEVICE void CopyTokensAndScales(AscendC::GlobalTensor<T> dst, AscendC::GlobalTensor<T> src, int32_t rows,
+                                            uint32_t hiddenSize, int32_t scaleStart)
+    {
+        static_assert(sizeof(T) == 1, "A2 INT8 packed token copier expects one-byte elements");
+        constexpr uint32_t bufferBytes = 32 * 1024;
+        uint32_t rowElements = hiddenSize + ALIGN_512;
+        uint32_t rowsPerBuffer = bufferBytes / rowElements;
+        using TType = Gemm::GemmType<T, layout::RowMajor>;
+        Epilogue::Tile::CopyGm2Ub<ArchTag, TType> copyGmToUb;
+        AscendC::LocalTensor<T> buffers[2] = {resource.ubBuf.template GetBufferByByte<T>(0),
+                                              resource.ubBuf.template GetBufferByByte<T>(96 * 1024)};
+        buffers[0].SetSize(bufferBytes);
+        buffers[1].SetSize(bufferBytes);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+        uint32_t pingpong = 0;
+        for (uint32_t row = 0; row < static_cast<uint32_t>(rows); row += rowsPerBuffer) {
+            uint32_t currentRows = min(rowsPerBuffer, static_cast<uint32_t>(rows) - row);
+            uint32_t elements = currentRows * rowElements;
+            uint32_t offset = row * rowElements;
+            AscendC::TEventID event = pingpong == 0 ? EVENT_ID0 : EVENT_ID1;
+            AscendC::LocalTensor<T> buf = buffers[pingpong];
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+            copyGmToUb(buf, src[offset], layout::RowMajor{1, elements}, layout::RowMajor{1, elements});
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+            AscendC::DataCopyPad(dst[offset], buf,
+                                 AscendC::DataCopyExtParams{static_cast<uint16_t>(currentRows), hiddenSize,
+                                                            ALIGN_512 / 32, ALIGN_512, 0});
+            AscendC::DataCopyPad(gmPerTokenScale1[scaleStart + row], buf[hiddenSize].template ReinterpretCast<float>(),
+                                 AscendC::DataCopyExtParams{static_cast<uint16_t>(currentRows), sizeof(float),
+                                                            rowElements / 32 - 1, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+            pingpong ^= 1;
+        }
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+    }
+
     // ============================================================
     // SendTokensV3：发送侧，三路径（self-rank / 同server / 跨server）
     //   - rows == 0 时提前 return（不写 flag，避免对端死等）
@@ -356,44 +398,16 @@ private:
         // windowsOut → UB → 本地 peer mem（只写 hiddenSize 有效数据）
         // scale inline 分离写入 gmScale，无需 epoch flag
         if (static_cast<int32_t>(RuntimeRank(params)) == dstEpIdx) {
-            AscendC::GlobalTensor<ElementPerTokenScale> gmScale;
-            gmScale.SetGlobalBuffer(
-                reinterpret_cast<__gm__ ElementPerTokenScale *>(shmem() + peermemInfo.offsetPeerPerTokenScale));
-
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            for (int32_t i = 0; i < rows; ++i) {
-                auto offset = i * copyInNum;
-                // windowsOut → UB (MTE2)
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-                copyGmToUb(bufT, src[offset], layout::RowMajor{1, copyInNum}, layout::RowMajor{1, copyInNum});
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                // UB → 本地 peer mem（只写 hiddenSize 有效数据）
-                copyUbToGm(dst[offset], bufT, layout::RowMajor{1, hiddenSize}, layout::RowMajor{1, hiddenSize});
-                // scale 分离写入独立 gmScale 区
-                AscendC::DataCopyPad(gmScale[rowStart + i], bufScale, {1, 4, 0, 0, 0});
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            }
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            // 自身 rank 无需写 flag，RecvTokensV3 中 srcEpIdx == rank 时直接 return
+            CopyTokensAndScales(dst, src, rows, hiddenSize, rowStart);
             return;
         }
 
         // ── 路径 B：同 server（IPC 直写远端 peer mem + IPC DataCopyPad flag）──
         if (dstServerId == serverId_) {
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            for (int32_t i = 0; i < rows; ++i) {
-                auto offset = i * copyInNum;
-                // windowsOut → UB (MTE2)
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-                copyGmToUb(bufT, src[offset], layout::RowMajor{1, copyInNum}, layout::RowMajor{1, copyInNum});
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                // UB → 远端 peer mem（IPC 直写，写完整 copyInNum，scale 由接收侧分离）
-                copyUbToGm(dst[offset], bufT, layout::RowMajor{1, copyInNum}, layout::RowMajor{1, copyInNum});
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            }
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            // Packed token rows are contiguous, including their per-token scales.
+            // Reuse the drained two-buffer copier to avoid one MTE round trip per row.
+            constexpr int32_t ipcMoveNum = 32 * 1024 / sizeof(T);
+            CopyGMToGM(dst, src, rows * copyInNum, ipcMoveNum);
 
             // 写远端 dispatch flag 槽（IPC 直写，与 CrossRankSync 同 server 路径一致）：
             //   1) PipeBarrier<PIPE_ALL>：保证上方 MTE3 数据已 commit，远端先看到数据再看到 flag；
@@ -474,9 +488,6 @@ private:
 
         uint32_t copyInNum = hiddenSize + ALIGN_512;
 
-        AscendC::LocalTensor<T> bufT = resource.ubBuf.template GetBufferByByte<T>(0);
-        AscendC::LocalTensor<float> bufScale = bufT[hiddenSize].template ReinterpretCast<float>();
-
         // 等待 dispatch flag：精确匹配 FLAG_VALUE_MAGIC，避免上一轮残留误判
         //   slotIdx = srcEpIdx * expertPerRank + groupIdx
         //   每槽 16 个 int32（= 64B = 一个 cache line）
@@ -492,37 +503,11 @@ private:
             }
         }
 
-        // 2. flag 到达 ⇒ 全部 rows2 个 token 均已写入本地 peer mem
-        //    使用 catlass CopyGm2Ub/CopyUb2Gm，与 SendTokensV3 保持一致：
-        //    - 读入完整 copyInNum（有效数据 + scale 占位），layout 语义明确
-        //    - 写回仅 hiddenSize 有效数据，catlass 内部处理非对齐 tail padding
-        using TType = Gemm::GemmType<T, layout::RowMajor>;
-        using CopyGmToUb = Epilogue::Tile::CopyGm2Ub<ArchTag, TType>;
-        using CopyUbToGm = Epilogue::Tile::CopyUb2Gm<ArchTag, TType>;
-        CopyGmToUb copyGmToUb;
-        CopyUbToGm copyUbToGm;
-
+        // The flag covers all rows; batch payload writeback and scale separation.
         AscendC::GlobalTensor<T> gmDstA;
         gmDstA.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(shmem() + peermemInfo.offsetA));
-        AscendC::GlobalTensor<ElementPerTokenScale> gmScale;
-        gmScale.SetGlobalBuffer(
-            reinterpret_cast<__gm__ ElementPerTokenScale *>(shmem() + peermemInfo.offsetPeerPerTokenScale));
-
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-        for (int32_t i = 0; i < rows2; ++i) {
-            auto offset = (rowStart2 + i) * copyInNum;
-            // GM → UB（读完整 copyInNum：含有效数据 + scale 部分）
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            copyGmToUb(bufT, gmDstA[offset], layout::RowMajor{1, copyInNum}, layout::RowMajor{1, copyInNum});
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-            // UB → GM（只写回 hiddenSize 有效数据，tail padding 由 catlass 内部处理）
-            copyUbToGm(gmDstA[offset], bufT, layout::RowMajor{1, hiddenSize}, layout::RowMajor{1, hiddenSize});
-            // scale 分离写入独立 gmScale 区
-            AscendC::DataCopyPad(gmScale[rowStart2 + i], bufScale, {1, 4, 0, 0, 0});
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-        }
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        uint32_t offset = rowStart2 * copyInNum;
+        CopyTokensAndScales(gmDstA[offset], gmDstA[offset], rows2, hiddenSize, rowStart2);
     }
 
     CATLASS_DEVICE
