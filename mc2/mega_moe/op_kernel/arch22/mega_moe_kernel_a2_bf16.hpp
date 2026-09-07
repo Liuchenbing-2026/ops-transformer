@@ -1327,89 +1327,8 @@ private:
     }
 
     CATLASS_DEVICE
-    void CombineFullRowsEP2(Params const &params, BlockEpilogue2 &blockEpilogue)
-    {
-        const int32_t rank = RuntimeRank(params);
-        const uint32_t aicCoreNum = coreNum / 2;
-        const uint32_t aicCoreIdx = get_block_idx();
-        const uint32_t peer = coreIdx % params.EP;
-        const uint32_t lane = coreIdx / params.EP;
-        const uint32_t lanesPerPeer = coreNum / params.EP;
-        uint32_t startCoreIdx = 0;
-        uint32_t sourceBase = 0;
-        uint32_t peerTotal = 0;
-        uint32_t syncGroup = 0;
-        BlockScheduler blockScheduler;
-
-        // Consume exactly the same per-AIC ready flags as CombineV2. After
-        // the AIV barrier, all GMM2 tiles are visible to any copy core.
-        for (uint32_t group = 0; group < params.expertPerRank; ++group) {
-            uint32_t rows = cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, group));
-            rows = sourceBase >= params.maxOutputSize ? 0 :
-                       min(rows, static_cast<uint32_t>(params.maxOutputSize - sourceBase));
-            GemmCoord shape{rows, params.problemShape.k(), params.problemShape.n() / 2};
-            blockScheduler.Update(shape, MakeCoord(L1TileShape::M, L1TileShape::N));
-            const uint32_t loops = blockScheduler.GetCoreLoops();
-            const uint32_t firstLoop =
-                ((aicCoreIdx < startCoreIdx) ? aicCoreIdx + aicCoreNum : aicCoreIdx) - startCoreIdx;
-            if (firstLoop < loops) {
-                for (; syncGroup <= group; ++syncGroup) {
-                    AscendC::CrossCoreWaitFlag<0x2>(syncGroup / CROSS_CORE_FLAG_MAX_SET_COUNT);
-                }
-            }
-            const uint32_t peerStart = peer == 0 ? 0 : tokenPerExpert(tokenPerExpertLayout(0, rank, group));
-            if (rows > peerStart) {
-                peerTotal += min(rows - peerStart,
-                                 static_cast<uint32_t>(tokenPerExpert(tokenPerExpertLayout(peer, rank, group))));
-            }
-            sourceBase += rows;
-            startCoreIdx = (startCoreIdx + loops) % aicCoreNum;
-        }
-        // Release the two hard-event credits armed by CombineSetFlag before
-        // CopyGMToGM takes ownership of those events and the UB buffers.
-        blockEpilogue.Finalize();
-        AscendC::SyncAll<true>();
-
-        const uint32_t begin = static_cast<uint64_t>(peerTotal) * lane / lanesPerPeer;
-        const uint32_t end = static_cast<uint64_t>(peerTotal) * (lane + 1) / lanesPerPeer;
-        const uint32_t hidden = params.problemShape.k();
-        AscendC::GlobalTensor<ElementC> destination;
-        destination.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(shmem(peermemInfo.offsetD, peer)));
-        sourceBase = 0;
-        uint32_t peerBase = 0;
-        for (uint32_t group = 0; group < params.expertPerRank; ++group) {
-            uint32_t rows = cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, group));
-            rows = sourceBase >= params.maxOutputSize ? 0 :
-                       min(rows, static_cast<uint32_t>(params.maxOutputSize - sourceBase));
-            const uint32_t peerStart = peer == 0 ? 0 : tokenPerExpert(tokenPerExpertLayout(0, rank, group));
-            const uint32_t peerRows = rows > peerStart ?
-                                         min(rows - peerStart, static_cast<uint32_t>(
-                                                                   tokenPerExpert(tokenPerExpertLayout(peer, rank, group)))) :
-                                         0;
-            const uint32_t copyBegin = max(begin, peerBase);
-            const uint32_t copyEnd = min(end, peerBase + peerRows);
-            if (copyBegin < copyEnd) {
-                const uint32_t offset = copyBegin - peerBase;
-                const uint32_t destinationBase = preSumBeforeRankForCombine(peer * params.expertPerRank + group);
-                const int64_t srcOffset = static_cast<int64_t>(sourceBase + peerStart + offset) * hidden;
-                const int64_t dstOffset = static_cast<int64_t>(destinationBase + offset) * hidden;
-                CopyGMToGM(destination[dstOffset], gmC2[srcOffset], (copyEnd - copyBegin) * hidden, UB_MOVE_NUM);
-            }
-            peerBase += peerRows;
-            sourceBase += rows;
-        }
-    }
-
-    CATLASS_DEVICE
     void CombineV2(Params const &params, BlockEpilogue2 &blockEpilogue)
     {
-        if constexpr (std::is_same_v<ElementC, bfloat16_t> && std::is_same_v<ElementD2, bfloat16_t>) {
-            if (params.EP == 2 && coreNum == 40 && params.expertPerRank == 128 &&
-                params.problemShape.k() == 2048 && params.problemShape.n() == 1024) {
-                CombineFullRowsEP2(params, blockEpilogue);
-                return;
-            }
-        }
         const int32_t rank = RuntimeRank(params);
         BlockScheduler blockScheduler;
         int32_t syncLoopIdx = 0;
