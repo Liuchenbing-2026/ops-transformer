@@ -1391,6 +1391,16 @@ private:
                     m_offset += m0;
                 }
             }
+            if (params.EP == 2 && serverId_ == 0) {
+                // Both EP2 peers use IPC under the server mapping below.
+                // Their output tiles are disjoint, so no per-expert RDMA
+                // fence is needed. Keep the per-AIC readiness waits above;
+                // Finalize and the caller's SyncAll/CrossRankSync drain all
+                // peer writes before unpermute reads the completed output.
+                preSrcExpertSum += currentExpertM;
+                startCoreIdx = (startCoreIdx + coreLoops) % aicCoreNum;
+                continue;
+            }
             AscendC::SyncAll<true>();
             int32_t preSumRankInExpert = 0;
             for (int32_t dstEpIdx = 0; dstEpIdx < params.EP; ++dstEpIdx) {
