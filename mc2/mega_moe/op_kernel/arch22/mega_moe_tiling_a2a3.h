@@ -33,6 +33,9 @@ using namespace Mc2Tiling;
 #define SOC_ASCEND910B 0
 #define SOC_ASCEND910_93 1
 
+// Identical full inputs on each EP rank; the caller reduces local expert outputs.
+constexpr uint32_t MEGA_MOE_COMM_REPLICATED_INPUT = 1;
+
 struct MegaMoeA2A3TilingData {
     uint32_t M;
     uint32_t K;

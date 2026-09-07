@@ -254,8 +254,17 @@ int64_t GetMegaMoeCclBufferSize(int64_t epWorldSize, int64_t moeExpertNum, int64
                     "ep_world_size only support {2, 4, 8, 16, 32, 64, 128} on A2/A3, but got ", epWorldSize);
         TORCH_CHECK(hidden >= 1024 && hidden <= 8192 && hidden % 512 == 0,
                     "hidden only support [1024, 8192] and hidden % 512 == 0 on A2/A3, but got ", hidden);
-        TORCH_CHECK(numMaxTokensPerRank >= 1 && numMaxTokensPerRank <= 4096,
-                    "num_max_tokens_per_rank only support [1, 4096] on A2/A3, but got ", numMaxTokensPerRank);
+        const bool replicatedInput = commAlg == "replicated_input";
+        if (replicatedInput) {
+            TORCH_CHECK(isA2 && epWorldSize == 2 && moeExpertNum == 256 && hidden == 2048 && numTopk == 8 &&
+                            dispatchQuantMode == 0 && combineQuantMode == 0,
+                        "replicated_input requires unquantized A2 EP2, E=256, H=2048, topk=8");
+        }
+        // Preserve the normal bound; reserve aligned sentinel rows only for
+        // the explicit full-input mode. Allocation and kernel use one bound.
+        const int64_t maxTokens = replicatedInput ? 4096 + 32 : 4096;
+        TORCH_CHECK(numMaxTokensPerRank >= 1 && numMaxTokensPerRank <= maxTokens,
+                    "num_max_tokens_per_rank exceeds the bound for comm_alg: ", numMaxTokensPerRank);
         TORCH_CHECK(moeExpertNum >= 1 && moeExpertNum <= 2048,
                     "moe_expert_num only support [1, 2048] on A2/A3, but got ", moeExpertNum);
         TORCH_CHECK(numTopk >= 1 && numTopk <= 16, "num_topk only support [1, 16] on A2/A3, but got ", numTopk);

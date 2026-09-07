@@ -98,6 +98,7 @@ constexpr int64_t SYNC_STATE_RESERVED_SIZE = 512 * 1024LL;
 // 维度范围限制
 constexpr int64_t MIN_BS = 1;
 constexpr int64_t MAX_BS = 4096;
+constexpr int64_t MAX_REPLICATED_BS = MAX_BS + 32; // Full prefill plus aligned sentinel rows.
 constexpr int64_t MIN_HIDDEN_SIZE = 1024;
 constexpr int64_t MAX_HIDDEN_SIZE = 8192;
 constexpr int64_t MIN_INTERMEDIATE_HIDDEN = 512;
@@ -265,6 +266,13 @@ static ge::graphStatus CheckCombineQuantModeAttr(const int64_t *ptr)
     return ge::GRAPH_SUCCESS;
 }
 
+static int64_t MaxBatchSizeForCommAlg(const gert::TilingContext *context)
+{
+    auto attrs = context->GetAttrs();
+    auto commAlg = attrs == nullptr ? nullptr : attrs->GetAttrPointer<char>(ATTR_COMM_ALG_INDEX);
+    return commAlg != nullptr && strcmp(commAlg, "replicated_input") == 0 ? MAX_REPLICATED_BS : MAX_BS;
+}
+
 // 校验 num_max_tokens_per_rank，需要从 x shape 获取 bs
 static ge::graphStatus CheckNumMaxTokensPerRankAttr(gert::TilingContext *context, const int64_t *ptr)
 {
@@ -278,9 +286,9 @@ static ge::graphStatus CheckNumMaxTokensPerRankAttr(gert::TilingContext *context
                         OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "num_max_tokens_per_rank", std::to_string(*ptr).c_str(),
                                                   (">= bs (" + std::to_string(bs) + ")").c_str()),
                         return GRAPH_FAILED);
-        OP_TILING_CHECK(*ptr < MIN_BS || *ptr > MAX_BS,
+        OP_TILING_CHECK(*ptr < MIN_BS || *ptr > MaxBatchSizeForCommAlg(context),
                         OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "num_max_tokens_per_rank", std::to_string(*ptr).c_str(),
-                                                  "in [1, 4096]"),
+                                                  "within the batch bound for comm_alg"),
                         return GRAPH_FAILED);
     }
     return ge::GRAPH_SUCCESS;
@@ -610,10 +618,10 @@ static ge::graphStatus CheckXInput(gert::TilingContext *context, const gert::Sto
     int64_t bs = xStorageShape->GetStorageShape().GetDim(0);
     int64_t hiddenSize = xStorageShape->GetStorageShape().GetDim(1);
 
-    OP_TILING_CHECK(bs < MIN_BS || bs > MAX_BS,
+    OP_TILING_CHECK(bs < MIN_BS || bs > MaxBatchSizeForCommAlg(context),
                     OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(K_OP_NAME, "x",
                                                           Ops::Base::ToString(xStorageShape->GetStorageShape()).c_str(),
-                                                          "dim0 (bs) must be in [1, 4096]"),
+                                                          "dim0 (bs) must be within the batch bound for comm_alg"),
                     return GRAPH_FAILED);
     OP_TILING_CHECK(hiddenSize < MIN_HIDDEN_SIZE || hiddenSize > MAX_HIDDEN_SIZE,
                     OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(K_OP_NAME, "x",
@@ -1168,8 +1176,8 @@ static ge::graphStatus MegaMoeA2A3GetPlatformInfoAndSetTiling(gert::TilingContex
     return ge::GRAPH_SUCCESS;
 }
 
-// 表示通信亲和内存布局算法，当前版本仅支持 ""。
-static ge::graphStatus MegaMoeA2A3CommAlg(const gert::TilingContext *context)
+// The replicated-input mode preserves the memory layout and changes ownership.
+static ge::graphStatus MegaMoeA2A3CommAlg(const gert::TilingContext *context, MegaMoeA2A3TilingData &info)
 {
     auto attrs = context->GetAttrs();
     OP_TILING_CHECK(attrs == nullptr, OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "Failed to get operator attributes."),
@@ -1178,8 +1186,21 @@ static ge::graphStatus MegaMoeA2A3CommAlg(const gert::TilingContext *context)
     OP_TILING_CHECK(commAlg == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", "null", "not null"),
                     return ge::GRAPH_FAILED);
 
-    if (strlen(commAlg) > 0) {
-        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg, "empty string");
+    info.commAlgCode = 0;
+    if (strcmp(commAlg, "replicated_input") == 0) {
+        // Explicit opt-in contract: identical full input/routing on both ranks,
+        // local partial outputs, followed by a caller-owned TP all-reduce.
+        auto xDesc = context->GetInputDesc(X_INDEX);
+        if (xDesc == nullptr || xDesc->GetDataType() != ge::DT_BF16 || info.isQuantRouting != 0 ||
+            info.worldSize != 2 || info.expertPerRank != 128 || info.K != 2048 || info.N != 1024 ||
+            info.topK != 8 || info.aivNum != 40 || info.maxRecvTokenNum < static_cast<uint64_t>(info.M) * info.topK) {
+            OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg,
+                                      "BF16 EP2, 128 experts/rank, H=2048, N=1024, topk=8, 40 AIV, full capacity");
+            return ge::GRAPH_FAILED;
+        }
+        info.commAlgCode = MEGA_MOE_COMM_REPLICATED_INPUT;
+    } else if (strlen(commAlg) > 0) {
+        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg, "empty string or replicated_input");
         return ge::GRAPH_FAILED;
     }
 
@@ -1320,8 +1341,6 @@ static ge::graphStatus MegaMoeA2A3TilingFuncImpl(gert::TilingContext *context)
     MegaMoeA2A3TilingData &info = tilingData->common;
     OP_LOGI(K_INNER_DEBUG, "MegaMoeA2A3 get tilingData info.");
 
-    OP_TILING_CHECK(MegaMoeA2A3CommAlg(context) != ge::GRAPH_SUCCESS,
-                    OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "MegaMoeA2A3 CheckCommAlg Failed"), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(MegaMoeA2A3CheckShapeAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
                     OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "MegaMoeA2A3 CheckShapeAndSetTiling Failed"),
                     return ge::GRAPH_FAILED);
@@ -1337,6 +1356,8 @@ static ge::graphStatus MegaMoeA2A3TilingFuncImpl(gert::TilingContext *context)
     OP_TILING_CHECK(MegaMoeA2A3CheckHcclBuffSize(context, info) != ge::GRAPH_SUCCESS,
                     OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "MegaMoeA2A3 CheckHcclBuffSize Failed"),
                     return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(MegaMoeA2A3CommAlg(context, info) != ge::GRAPH_SUCCESS,
+                    OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "MegaMoeA2A3 CheckCommAlg Failed"), return ge::GRAPH_FAILED);
 
     // 2. set blockDim
     uint32_t blockDim = 1U;
