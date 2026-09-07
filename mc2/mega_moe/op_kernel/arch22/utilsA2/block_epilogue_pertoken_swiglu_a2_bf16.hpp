@@ -239,6 +239,36 @@ public:
             return;
         }
 
+        // The 512-wide non-quantized branch fits six rows in the existing
+        // tile buffers. Pack gate/up rows separately, then run the identical
+        // elementwise activation and BF16 cast over the contiguous batch.
+        // This amortizes DMA events and vector barriers across those rows.
+        if (branchLength == 512 && activationCode == 0) {
+            constexpr uint32_t rowsPerBatch = TILE_LENGTH / 512;
+            static_assert(rowsPerBatch > 0 && rowsPerBatch * 512 <= TILE_LENGTH);
+            uint32_t processed = 0;
+            uint32_t currentStage = 0;
+            if (tasksForIdx > 0) {
+                LoadRowBatch(gmC[loopStartIdx * gmmOutPreRowStride], branchLength,
+                             min(rowsPerBatch, tasksForIdx), gmmOutPreRowStride, currentStage);
+            }
+            while (processed < tasksForIdx) {
+                uint32_t rows = min(rowsPerBatch, tasksForIdx - processed);
+                uint32_t nextProcessed = processed + rows;
+                uint32_t nextStage = NextStage(currentStage);
+                if (nextProcessed < tasksForIdx) {
+                    LoadRowBatch(gmC[(loopStartIdx + nextProcessed) * gmmOutPreRowStride], branchLength,
+                                 min(rowsPerBatch, tasksForIdx - nextProcessed), gmmOutPreRowStride, nextStage);
+                }
+                uint32_t elements = rows * branchLength;
+                ComputeLoadedTile(currentStage, elements, 1.0f, false, activationClamp);
+                CopyDirectTile(currentStage, gmD[(loopStartIdx + processed) * branchLength], elements);
+                processed = nextProcessed;
+                currentStage = nextStage;
+            }
+            return;
+        }
+
         for (uint32_t loopIdx = loopStartIdx; loopIdx < loopStartIdx + tasksForIdx; ++loopIdx) {
             auto gmTileC = gmC[loopIdx * gmmOutPreRowStride];
             auto gmTileD = gmD[loopIdx * branchLength];
@@ -339,6 +369,19 @@ private:
         LayoutC gmTileLayout{1, tileLength, gmRowStride};
         copyGmToUbC(ubC, gmTileC[tileOffset], tileLayout, gmTileLayout);
         copyGmToUbC(ubC[TILE_LENGTH], gmTileC[branchLength + tileOffset], tileLayout, gmTileLayout);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventUbCMTE2VList[stageId]);
+    }
+
+    CATLASS_DEVICE
+    void LoadRowBatch(AscendC::GlobalTensor<ElementC> const &gmRows, uint32_t branchLength, uint32_t rows,
+                      uint32_t gmRowStride, uint32_t stageId)
+    {
+        auto &ubC = ubCList[stageId];
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventUbCVMTE2List[stageId]);
+        LayoutC compactLayout{rows, branchLength};
+        LayoutC gmLayout{rows, branchLength, gmRowStride};
+        copyGmToUbC(ubC, gmRows, compactLayout, gmLayout);
+        copyGmToUbC(ubC[TILE_LENGTH], gmRows[branchLength], compactLayout, gmLayout);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventUbCMTE2VList[stageId]);
     }
 
