@@ -423,6 +423,13 @@ __aicore__ inline void MegaMoeA2<MegaMoeFuncA2>::Process()
     } else {
         epilogueCoreNum = static_cast<uint32_t>(aivNum_); // 所有 AIV 参与
         epilogueGranularity = (expertPerRank_ > 2) ? static_cast<uint32_t>(expertPerRank_ - 2) : 1u;
+        if constexpr (std::is_same_v<AType_, bfloat16_t> && std::is_same_v<BType_, bfloat16_t>) {
+            if (epWorldSize_ == 2 && expertPerRank_ == 128 && k_ == 2048 && n_ == 1024 && m_ >= 512) {
+                // Reuse the two existing activation handshakes, with a balanced
+                // prefix so activation can overlap the remaining GMM1 experts.
+                epilogueGranularity = static_cast<uint32_t>(expertPerRank_ / 2);
+            }
+        }
         using MatmulKernel = Gemm::Kernel::MegaMoeKernelA2BF16<BlockMmad, BlockScheduler, ElementGroupList,
                                                                BlockEpilogue1, BlockEpilogue2>;
         typename MatmulKernel::Params params{problemShape,
