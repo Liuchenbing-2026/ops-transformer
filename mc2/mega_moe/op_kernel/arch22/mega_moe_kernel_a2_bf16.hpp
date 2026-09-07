@@ -342,39 +342,16 @@ private:
         // ── 路径 A：self-rank ──────────────────────────────────────────
         // windowsOut → UB → 本地 peer mem（只写 hiddenSize 有效数据），无需 epoch flag
         if (rank == dstEpIdx) {
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            for (int32_t i = 0; i < rows; ++i) {
-                auto offset = i * copyInNum;
-                // windowsOut → UB (MTE2)
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-                copyGmToUb(bufT, src[offset], layout::RowMajor{1, copyInNum}, layout::RowMajor{1, copyInNum});
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                // UB → 本地 peer mem（只写 hiddenSize 有效数据）
-                copyUbToGm(dst[offset], bufT, layout::RowMajor{1, hiddenSize}, layout::RowMajor{1, hiddenSize});
-                // scale 分离写入独立 gmScale 区
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            }
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            // BF16 rows have no per-token scale tail. Move up to 32 KiB
+            // per buffer instead of synchronizing two DMA pipes per token.
+            CopyGMToGM(dst, src, rows * copyInNum, UB_MOVE_NUM);
             // 自身 rank 无需写 flag，RecvTokensV3 中 srcEpIdx == rank 时直接 return
             return;
         }
 
         // ── 路径 B：同 server（IPC 直写远端 peer mem + gm_store + gm_dcci 写 flag）──
         if (dstServerId == serverId_) {
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            for (int32_t i = 0; i < rows; ++i) {
-                auto offset = i * copyInNum;
-                // windowsOut → UB (MTE2)
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-                copyGmToUb(bufT, src[offset], layout::RowMajor{1, copyInNum}, layout::RowMajor{1, copyInNum});
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                // UB → 远端 peer mem（IPC 直写，写完整 copyInNum，scale 由接收侧分离）
-                copyUbToGm(dst[offset], bufT, layout::RowMajor{1, copyInNum}, layout::RowMajor{1, copyInNum});
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            }
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            CopyGMToGM(dst, src, rows * copyInNum, UB_MOVE_NUM);
 
             // 写远端 dispatch flag 槽（IPC 直写，与 CrossRankSync 同 server 路径一致）：
             //   1) PipeBarrier<PIPE_ALL>：保证上方 MTE3 数据已 commit，远端先看到数据再看到 flag；
@@ -1078,87 +1055,179 @@ private:
         uint32_t prevGroupSum2 = 0;
         icache_preload(8);
         exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::DISPATCH);
-        for (int32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
-            // rank 本轮专家组接收的 token 总数（所有 source rank 之和）
-            uint32_t currentRankM =
-                static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, groupIdx)));
-
-            // ── SEND 阶段：各 core 并行发送到对应 dstEpIdx ───────────
-            // currentMSend: 本 core 处理的 dstEpIdx 接收到的 token 总数
-            // （用于更新 prevGroupSum1；EP ≤ coreNum 时每 core 恰好处理 1 个 dstEpIdx）
-            uint32_t currentMSend = 0;
-
-            for (int32_t dstEpIdx = static_cast<int32_t>(coreIdx); dstEpIdx < params.EP;
-                 dstEpIdx += static_cast<int32_t>(coreNum)) {
-                uint32_t arrIdx = static_cast<uint32_t>(dstEpIdx) / coreNum;
-                uint32_t rowStart =
-                    prevGroupSum1Arr[arrIdx] +
-                    (rank == 0 ? 0u :
-                                 static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(rank - 1, dstEpIdx, groupIdx))));
-                currentMSend = static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(params.EP - 1, dstEpIdx, groupIdx)));
-                if (rowStart < params.maxOutputSize) {
-                    uint32_t rows = tokenPerExpert(tokenPerExpertLayout(rank, dstEpIdx, groupIdx));
-                    if (rowStart + rows > params.maxOutputSize) {
-                        rows = params.maxOutputSize - rowStart;
+        constexpr uint32_t dispatchExpertsPerWave = 20;
+        if (params.EP == 2 && coreNum == 2 * dispatchExpertsPerWave) {
+            // EP2 maps each pair of AIV cores to one expert. All twenty
+            // experts have disjoint peer-memory rows and dispatch flag slots.
+            // Keep send/receive phases separate; notify GMM1 in expert order
+            // only after every receiver in the wave has observed its sender flag.
+            const uint32_t peerIdx = coreIdx % params.EP;
+            const uint32_t expertLane = coreIdx / params.EP;
+            uint32_t peerExpertBase = 0;
+            for (uint32_t waveStart = 0; waveStart < params.expertPerRank; waveStart += dispatchExpertsPerWave) {
+                const uint32_t waveEnd =
+                    min(waveStart + dispatchExpertsPerWave, static_cast<uint32_t>(params.expertPerRank));
+                const uint32_t groupIdx = waveStart + expertLane;
+                uint32_t sendExpertBase = peerExpertBase;
+                uint32_t recvExpertBase = prevGroupSum2;
+                for (uint32_t prior = waveStart; prior < min(groupIdx, waveEnd); ++prior) {
+                    sendExpertBase +=
+                        static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(params.EP - 1, peerIdx, prior)));
+                    recvExpertBase += static_cast<uint32_t>(
+                        cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, prior)));
+                }
+                if (groupIdx < waveEnd) {
+                    uint32_t rowStart = sendExpertBase + (rank == 0 ?
+                                                              0u :
+                                                              static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(
+                                                                  rank - 1, peerIdx, groupIdx))));
+                    if (rowStart < params.maxOutputSize) {
+                        uint32_t rows = tokenPerExpert(tokenPerExpertLayout(rank, peerIdx, groupIdx));
+                        if (rowStart + rows > params.maxOutputSize) {
+                            rows = params.maxOutputSize - rowStart;
+                        }
+                        uint32_t rowSrc = preSumBeforeRankForDispatch(peerIdx * params.expertPerRank + groupIdx);
+                        AscendC::GlobalTensor<ElementA> gmSrcA;
+                        gmSrcA.SetGlobalBuffer(
+                            reinterpret_cast<__gm__ ElementA *>(shmem.windowsOutAddr() + peermemInfo.offsetWinOutA));
+                        int64_t gmSrcOffset = static_cast<int64_t>(rowSrc) * params.problemShape.k();
+                        AscendC::GlobalTensor<ElementA> gmRemoteDstA;
+                        gmRemoteDstA.SetGlobalBuffer(
+                            reinterpret_cast<__gm__ ElementA *>(shmem(0, peerIdx) + peermemInfo.offsetA));
+                        int64_t gmDstOffset = static_cast<int64_t>(rowStart) * params.problemShape.k();
+                        SendTokensV3<ElementA>(gmRemoteDstA[gmDstOffset], gmSrcA[gmSrcOffset],
+                                               static_cast<int32_t>(rows), params.problemShape.k(),
+                                               static_cast<int32_t>(peerIdx), static_cast<int32_t>(groupIdx),
+                                               static_cast<int32_t>(rowStart), params);
                     }
-                    uint32_t rowSrc = preSumBeforeRankForDispatch(dstEpIdx * params.expertPerRank + groupIdx);
-                    AscendC::GlobalTensor<ElementA> gmSrcA;
-                    gmSrcA.SetGlobalBuffer(
-                        reinterpret_cast<__gm__ ElementA *>(shmem.windowsOutAddr() + peermemInfo.offsetWinOutA));
-                    int64_t gmSrcOffset = static_cast<int64_t>(rowSrc) * params.problemShape.k();
-
-                    AscendC::GlobalTensor<ElementA> gmRemoteDstA;
-                    gmRemoteDstA.SetGlobalBuffer(
-                        reinterpret_cast<__gm__ ElementA *>(shmem(0, dstEpIdx) + peermemInfo.offsetA));
-                    int64_t gmDstOffset = static_cast<int64_t>(rowStart) * params.problemShape.k();
-
-                    SendTokensV3<ElementA>(gmRemoteDstA[gmDstOffset], gmSrcA[gmSrcOffset], static_cast<int32_t>(rows),
-                                           params.problemShape.k(), dstEpIdx, groupIdx, static_cast<int32_t>(rowStart),
-                                           params);
                 }
-                prevGroupSum1Arr[arrIdx] += currentMSend;
-            }
-
-            // ── RECV 阶段：各 core 并行等 epoch flag ──
-            for (int32_t srcEpIdx = static_cast<int32_t>(coreIdx); srcEpIdx < params.EP;
-                 srcEpIdx += static_cast<int32_t>(coreNum)) {
-                // rowStart2：srcEpIdx 的 token 在本 rank peer mem 中的起始行号
-                uint32_t rowStart2 =
-                    prevGroupSum2 +
-                    (srcEpIdx == 0 ?
-                         0u :
-                         static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(srcEpIdx - 1, rank, groupIdx))));
-                if (rowStart2 < params.maxOutputSize) {
-                    uint32_t rows2 =
-                        static_cast<uint32_t>(tokenPerExpert(tokenPerExpertLayout(srcEpIdx, rank, groupIdx)));
-                    if (rows2 + rowStart2 > params.maxOutputSize) {
-                        rows2 = params.maxOutputSize - rowStart2;
+                AscendC::SyncAll<true>();
+                if (groupIdx < waveEnd) {
+                    uint32_t rowStart2 =
+                        recvExpertBase + (peerIdx == 0 ? 0u :
+                                                         static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(
+                                                             peerIdx - 1, rank, groupIdx))));
+                    if (rowStart2 < params.maxOutputSize) {
+                        uint32_t rows2 = tokenPerExpert(tokenPerExpertLayout(peerIdx, rank, groupIdx));
+                        if (rowStart2 + rows2 > params.maxOutputSize) {
+                            rows2 = params.maxOutputSize - rowStart2;
+                        }
+                        RecvTokensV3<ElementA>(static_cast<int32_t>(rows2), static_cast<int32_t>(rowStart2),
+                                               params.problemShape.k(), static_cast<int32_t>(peerIdx),
+                                               static_cast<int32_t>(groupIdx), params);
                     }
-                    RecvTokensV3<ElementA>(static_cast<int32_t>(rows2), static_cast<int32_t>(rowStart2),
-                                           params.problemShape.k(), srcEpIdx, groupIdx, params);
+                }
+                AscendC::SyncAll<true>();
+                // Every AIV core publishes the same ordered notification sequence.
+                // The counter partition and epilogue granularity remain unchanged.
+                for (uint32_t groupIdx = waveStart; groupIdx < waveEnd; ++groupIdx) {
+                    uint32_t currentRankM = static_cast<uint32_t>(
+                        cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, groupIdx)));
+                    peerExpertBase +=
+                        static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(params.EP - 1, peerIdx, groupIdx)));
+                    prevGroupSum2 += currentRankM;
+                    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                    syncgmm1Idx++;
+                    // Token 计数（用于 epilogue SwiGLU 输入范围）
+                    if (groupIdx + 1 <= params.epilogueGranularity) {
+                        if (dequantSum1 + currentRankM <= params.maxOutputSize) {
+                            dequantSum1 += currentRankM;
+                        } else if (dequantSum1 < params.maxOutputSize) {
+                            dequantSum1 = params.maxOutputSize;
+                        }
+                    }
+                    if (groupIdx + 1 > params.epilogueGranularity && dequantSum1 < params.maxOutputSize) {
+                        if (dequantSum1 + dequantSum2 + currentRankM <= params.maxOutputSize) {
+                            dequantSum2 += currentRankM;
+                        } else if (dequantSum1 + dequantSum2 < params.maxOutputSize) {
+                            dequantSum2 += params.maxOutputSize - dequantSum1 - dequantSum2;
+                        }
+                    }
                 }
             }
-            AscendC::SyncAll<true>(); // 等待所有 core 接收完成，后续 GEMM 可用
+        } else {
+            for (int32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
+                // rank 本轮专家组接收的 token 总数（所有 source rank 之和）
+                uint32_t currentRankM =
+                    static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, groupIdx)));
 
-            // 更新下一轮 groupIdx 的基准偏移
-            prevGroupSum2 += currentRankM; // rank 累计收到的 token 数
+                // ── SEND 阶段：各 core 并行发送到对应 dstEpIdx ───────────
+                // currentMSend: 本 core 处理的 dstEpIdx 接收到的 token 总数
+                // （用于更新 prevGroupSum1；EP ≤ coreNum 时每 core 恰好处理 1 个 dstEpIdx）
+                uint32_t currentMSend = 0;
 
-            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
-            syncgmm1Idx++;
+                for (int32_t dstEpIdx = static_cast<int32_t>(coreIdx); dstEpIdx < params.EP;
+                     dstEpIdx += static_cast<int32_t>(coreNum)) {
+                    uint32_t arrIdx = static_cast<uint32_t>(dstEpIdx) / coreNum;
+                    uint32_t rowStart =
+                        prevGroupSum1Arr[arrIdx] +
+                        (rank == 0 ? 0u :
+                                     static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(rank - 1, dstEpIdx, groupIdx))));
+                    currentMSend = static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(params.EP - 1, dstEpIdx, groupIdx)));
+                    if (rowStart < params.maxOutputSize) {
+                        uint32_t rows = tokenPerExpert(tokenPerExpertLayout(rank, dstEpIdx, groupIdx));
+                        if (rowStart + rows > params.maxOutputSize) {
+                            rows = params.maxOutputSize - rowStart;
+                        }
+                        uint32_t rowSrc = preSumBeforeRankForDispatch(dstEpIdx * params.expertPerRank + groupIdx);
+                        AscendC::GlobalTensor<ElementA> gmSrcA;
+                        gmSrcA.SetGlobalBuffer(
+                            reinterpret_cast<__gm__ ElementA *>(shmem.windowsOutAddr() + peermemInfo.offsetWinOutA));
+                        int64_t gmSrcOffset = static_cast<int64_t>(rowSrc) * params.problemShape.k();
 
-            // Token 计数（用于 epilogue SwiGLU 输入范围）
-            if (groupIdx + 1 <= params.epilogueGranularity) {
-                if (dequantSum1 + currentRankM <= params.maxOutputSize) {
-                    dequantSum1 += currentRankM;
-                } else if (dequantSum1 < params.maxOutputSize) {
-                    dequantSum1 = params.maxOutputSize;
+                        AscendC::GlobalTensor<ElementA> gmRemoteDstA;
+                        gmRemoteDstA.SetGlobalBuffer(
+                            reinterpret_cast<__gm__ ElementA *>(shmem(0, dstEpIdx) + peermemInfo.offsetA));
+                        int64_t gmDstOffset = static_cast<int64_t>(rowStart) * params.problemShape.k();
+
+                        SendTokensV3<ElementA>(gmRemoteDstA[gmDstOffset], gmSrcA[gmSrcOffset], static_cast<int32_t>(rows),
+                                               params.problemShape.k(), dstEpIdx, groupIdx, static_cast<int32_t>(rowStart),
+                                               params);
+                    }
+                    prevGroupSum1Arr[arrIdx] += currentMSend;
                 }
-            }
-            if (groupIdx + 1 > params.epilogueGranularity && dequantSum1 < params.maxOutputSize) {
-                if (dequantSum1 + dequantSum2 + currentRankM <= params.maxOutputSize) {
-                    dequantSum2 += currentRankM;
-                } else if (dequantSum1 + dequantSum2 < params.maxOutputSize) {
-                    dequantSum2 += params.maxOutputSize - dequantSum1 - dequantSum2;
+
+                // ── RECV 阶段：各 core 并行等 epoch flag ──
+                for (int32_t srcEpIdx = static_cast<int32_t>(coreIdx); srcEpIdx < params.EP;
+                     srcEpIdx += static_cast<int32_t>(coreNum)) {
+                    // rowStart2：srcEpIdx 的 token 在本 rank peer mem 中的起始行号
+                    uint32_t rowStart2 =
+                        prevGroupSum2 +
+                        (srcEpIdx == 0 ?
+                             0u :
+                             static_cast<uint32_t>(cumsumMM(tokenPerExpertLayout(srcEpIdx - 1, rank, groupIdx))));
+                    if (rowStart2 < params.maxOutputSize) {
+                        uint32_t rows2 =
+                            static_cast<uint32_t>(tokenPerExpert(tokenPerExpertLayout(srcEpIdx, rank, groupIdx)));
+                        if (rows2 + rowStart2 > params.maxOutputSize) {
+                            rows2 = params.maxOutputSize - rowStart2;
+                        }
+                        RecvTokensV3<ElementA>(static_cast<int32_t>(rows2), static_cast<int32_t>(rowStart2),
+                                               params.problemShape.k(), srcEpIdx, groupIdx, params);
+                    }
+                }
+                AscendC::SyncAll<true>(); // 等待所有 core 接收完成，后续 GEMM 可用
+
+                // 更新下一轮 groupIdx 的基准偏移
+                prevGroupSum2 += currentRankM; // rank 累计收到的 token 数
+
+                AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                syncgmm1Idx++;
+
+                // Token 计数（用于 epilogue SwiGLU 输入范围）
+                if (groupIdx + 1 <= params.epilogueGranularity) {
+                    if (dequantSum1 + currentRankM <= params.maxOutputSize) {
+                        dequantSum1 += currentRankM;
+                    } else if (dequantSum1 < params.maxOutputSize) {
+                        dequantSum1 = params.maxOutputSize;
+                    }
+                }
+                if (groupIdx + 1 > params.epilogueGranularity && dequantSum1 < params.maxOutputSize) {
+                    if (dequantSum1 + dequantSum2 + currentRankM <= params.maxOutputSize) {
+                        dequantSum2 += currentRankM;
+                    } else if (dequantSum1 + dequantSum2 < params.maxOutputSize) {
+                        dequantSum2 += params.maxOutputSize - dequantSum1 - dequantSum2;
+                    }
                 }
             }
         }
