@@ -116,6 +116,7 @@ public:
         float swigluLimit;
         uint32_t activationCode{0};
         bool replicatedDispatch{false};
+        bool localPartial{false};
         float activationParams1{Epilogue::SwigluOaiActivation::DEFAULT_ALPHA};
         float activationParams2{Epilogue::SituActivation::DEFAULT_BETA};
         GM_ADDR contextGM{nullptr};
@@ -537,6 +538,13 @@ private:
                                         CROSS_CORE_FLAG_MAX_SET_COUNT); // Wait for AIV to finish cumsum for matmul
         syncgmmIdx++;
 
+        if (params.localPartial) {
+            // InitRouting has already packed this rank's experts contiguously.
+            int64_t localRow = preSumBeforeRankForDispatch(rank * params.expertPerRank);
+            gmA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                shmem.windowsOutAddr() + peermemInfo.offsetWinOutA) + localRow * params.problemShape.k());
+        }
+
         for (uint32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
             uint32_t currentM = cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, groupIdx));
             if (preCurrentmSum >= params.maxOutputSize) {
@@ -628,6 +636,13 @@ private:
     void GMM2(Params const &params)
     {
         const int32_t rank = RuntimeRank(params);
+        if (params.localPartial) {
+            // Write directly into the sorted local-expert interval consumed by
+            // unpermute. Indices outside this interval are masked before GMM1.
+            int64_t localRow = preSumBeforeRankForDispatch(rank * params.expertPerRank);
+            gmC2.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(shmem() + peermemInfo.offsetD) +
+                                localRow * params.problemShape.k());
+        }
         icache_preload(8);
         BlockScheduler blockScheduler;
         BlockMmad blockMmad(resource);
@@ -1150,7 +1165,11 @@ private:
 
             AscendC::SyncAll<true>();
             exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::ALLGATHER_TOKEN_PER_EXPERT);
-            CrossRankSyncAndlocalTokenPerExpertAllGatherAndGetSumPreRankV2(params, localTokenPerExpertOffset);
+            if (params.localPartial) {
+                PrepareLocalPartial(params, localTokenPerExpertOffset);
+            } else {
+                CrossRankSyncAndlocalTokenPerExpertAllGatherAndGetSumPreRankV2(params, localTokenPerExpertOffset);
+            }
         }
 
         if (coreIdx == 0) {
@@ -1179,7 +1198,20 @@ private:
         icache_preload(8);
         exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::DISPATCH);
         constexpr uint32_t dispatchExpertsPerWave = 20;
-        if (params.replicatedDispatch) {
+        if (params.localPartial) {
+            // No dispatch: gmA aliases the completed routing output. Publish
+            // the unchanged per-expert readiness sequence for GMM1.
+            for (uint32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
+                uint32_t currentM = cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, groupIdx));
+                AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                syncgmm1Idx++;
+                if (groupIdx + 1 <= params.epilogueGranularity) {
+                    dequantSum1 += currentM;
+                } else {
+                    dequantSum2 += currentM;
+                }
+            }
+        } else if (params.replicatedDispatch) {
             // Same destination rows and wave readiness as ordinary EP2. Both
             // source-shard routes live in this rank's local output window.
             const uint32_t src = coreIdx % params.EP;
@@ -1462,7 +1494,11 @@ private:
         exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::COMBINE);
         CombineSetFlag();
 
-        CombineV2(params, blockEpilogue2);
+        if (params.localPartial) {
+            WaitLocalPartialGMM2(params, blockEpilogue2);
+        } else {
+            CombineV2(params, blockEpilogue2);
+        }
 
         AscendC::SyncAll<true>();
         exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::RESET_TOKEN_PER_EXPERT);
@@ -1470,7 +1506,7 @@ private:
         ResetTokenPerExpert(params, params.EP * paddedExpertNumAligned);
         AscendC::SyncAll<true>();
         exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::CROSS_RANK_SYNC);
-        {
+        if (!params.localPartial) {
             // 3 * UB_ALIGN scratch: payload + rdma doorbell + rdma head.
             // UB at offset 0 is unused at this point in the kernel.
             AscendC::LocalTensor<int32_t> ctrBuffer = resource.ubBuf.template GetBufferByByte<int32_t>(0);
@@ -1494,6 +1530,109 @@ private:
                                                outputRow * n2 * sizeof(ElementD2), &tilingData);
             kernelMoeTokenUnpermuteOp.Process();
         }
+    }
+
+    CATLASS_DEVICE
+    void PrepareLocalPartial(Params const &params, int64_t localTokenPerExpertOffset)
+    {
+        // Each rank receives the same full token set and retains only its expert
+        // interval, without copying payloads between ranks.
+        AscendC::LocalTensor<int32_t> zeros = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+        if (coreIdx == 0) {
+            const uint32_t rank = RuntimeRank(params);
+            // Keep the existing [source rank, global expert] metadata layout,
+            // with only the current rank's row populated.
+            AscendC::Duplicate(zeros, 0, params.EP * paddedExpertNumAligned);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            AscendC::DataCopy(tokenPerExpert, zeros, params.EP * paddedExpertNumAligned);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            AscendC::GlobalTensor<int32_t> source;
+            source.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(
+                shmem.windowsOutAddr() + localTokenPerExpertOffset));
+            CopyGMToGM(tokenPerExpert[tokenPerExpertLayout(rank, 0, 0)], source, paddedExpertNumAligned, UB_MOVE_NUM);
+
+            AscendC::LocalTensor<int32_t> counts = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+            AscendC::LocalTensor<int32_t> prefix = counts[paddedExpertNumAligned];
+            AscendC::DataCopy(counts, source, paddedExpertNumAligned);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            const uint32_t experts = params.EP * params.expertPerRank;
+            uint32_t sum = 0;
+            for (uint32_t expert = 0; expert < experts; ++expert) {
+                prefix(expert) = sum;
+                sum += counts(expert);
+            }
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::DataCopy(preSumBeforeRankForDispatch, prefix, experts);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        AscendC::SyncAll<true>();
+
+        const uint32_t rank = RuntimeRank(params);
+        const int32_t firstRow = preSumBeforeRankForDispatch(rank * params.expertPerRank);
+        int32_t lastRow = firstRow;
+        for (uint32_t expert = 0; expert < params.expertPerRank; ++expert) {
+            lastRow += tokenPerExpert(tokenPerExpertLayout(rank, rank, expert));
+        }
+        const uint32_t slots = params.problemShape.m() * params.topK;
+        constexpr uint32_t indexChunk = 1024;
+        AscendC::GlobalTensor<int32_t> indices;
+        indices.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(workspaceInfo.expandedRowIdx));
+        AscendC::LocalTensor<int32_t> local = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+        // Whole 32-byte index groups have a single writer. The only tail uses
+        // DataCopyPad. Use a nonnegative out-of-range index, as unpermute tests
+        // index < num_out_tokens and does not accept a negative sentinel.
+        for (uint32_t start = coreIdx * indexChunk; start < slots; start += coreNum * indexChunk) {
+            const uint32_t count = min(indexChunk, slots - start);
+            AscendC::DataCopyPad(local, indices[start],
+                AscendC::DataCopyExtParams{1, count * static_cast<uint32_t>(sizeof(int32_t)), 0, 0, 0},
+                AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            for (uint32_t i = 0; i < count; ++i) {
+                if (local(i) < firstRow || local(i) >= lastRow) {
+                    local(i) = slots;
+                }
+            }
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::DataCopyPad(indices[start], local,
+                AscendC::DataCopyExtParams{1, count * static_cast<uint32_t>(sizeof(int32_t)), 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        }
+        AscendC::SyncAll<true>();
+    }
+
+    CATLASS_DEVICE
+    void WaitLocalPartialGMM2(Params const &params, BlockEpilogue2 &blockEpilogue)
+    {
+        // GMM2 wrote the final sorted slots directly. Consume exactly the
+        // readiness flags each paired AIC would expose to CombineV2.
+        const uint32_t rank = RuntimeRank(params);
+        const uint32_t aicCores = coreNum / 2;
+        const uint32_t aicIdx = get_block_idx();
+        uint32_t startCore = 0;
+        uint32_t syncExpert = 0;
+        BlockScheduler scheduler;
+        for (uint32_t expert = 0; expert < params.expertPerRank; ++expert) {
+            uint32_t rows = cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, expert));
+            scheduler.Update(GemmCoord{rows, params.problemShape.k(), params.problemShape.n() / 2},
+                             MakeCoord(L1TileShape::M, L1TileShape::N));
+            uint32_t loops = scheduler.GetCoreLoops();
+            uint32_t first = ((aicIdx < startCore) ? aicIdx + aicCores : aicIdx) - startCore;
+            if (first < loops) {
+                for (; syncExpert <= expert; ++syncExpert) {
+                    AscendC::CrossCoreWaitFlag<0x2>(syncExpert / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                }
+            }
+            startCore = (startCore + loops) % aicCores;
+        }
+        blockEpilogue.Finalize();
     }
 
     CATLASS_DEVICE

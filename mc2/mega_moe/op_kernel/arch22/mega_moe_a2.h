@@ -472,6 +472,7 @@ __aicore__ inline void MegaMoeA2<MegaMoeFuncA2>::Process()
                                               activationParams2_,
                                               tilingGM_};
 
+        params.localPartial = commAlgCode_ == MEGA_MOE_COMM_LOCAL_PARTIAL_TP4;
         params.replicatedDispatch = commAlgCode_ == MEGA_MOE_COMM_REPLICATED_DISPATCH;
         if (params.replicatedDispatch) {
             params.problemShape = GemmCoord{static_cast<uint32_t>(m_ / 2),

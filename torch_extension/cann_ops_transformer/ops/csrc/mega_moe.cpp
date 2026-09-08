@@ -260,7 +260,15 @@ int64_t GetMegaMoeCclBufferSize(int64_t epWorldSize, int64_t moeExpertNum, int64
                             dispatchQuantMode == 0 && combineQuantMode == 0 && numMaxTokensPerRank % 2 == 0,
                         "replicated_dispatch requires unquantized A2 EP2 E256/H2048/K8 and equal source shards");
         }
-        const int64_t maxTokens = replicatedDispatch ? 4096 + 32 : 4096;
+        const bool localPartial = commAlg == "local_partial_tp4";
+        if (localPartial) {
+            TORCH_CHECK(isA2 && epWorldSize == 4 && moeExpertNum == 256 && hidden == 2048 && numTopk == 8 &&
+                            dispatchQuantMode == 0 && combineQuantMode == 0,
+                        "local_partial_tp4 requires unquantized A2 EP4 E256/H2048/K8");
+            TORCH_CHECK(maxRecvTokenNum >= numMaxTokensPerRank * numTopk,
+                        "local_partial_tp4 requires explicit full routed-row capacity");
+        }
+        const int64_t maxTokens = localPartial ? 8192 + 32 : (replicatedDispatch ? 4096 + 32 : 4096);
         TORCH_CHECK(numMaxTokensPerRank >= 1 && numMaxTokensPerRank <= maxTokens,
                     "num_max_tokens_per_rank exceeds the bound for comm_alg: ", numMaxTokensPerRank);
         TORCH_CHECK(moeExpertNum >= 1 && moeExpertNum <= 2048,

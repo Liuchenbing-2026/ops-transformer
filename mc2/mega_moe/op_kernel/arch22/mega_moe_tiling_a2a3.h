@@ -36,6 +36,9 @@ using namespace Mc2Tiling;
 // Full inputs contain source-0 then source-1 shards, including their sentinels.
 // Output owns one token shard (the other is zero); arithmetic/combination is unchanged.
 constexpr uint32_t MEGA_MOE_COMM_REPLICATED_DISPATCH = 2;
+// Full replicated input; output is this rank's BF16 local expert partial sum.
+// The caller must retain the final reduction with its shared-expert partial.
+constexpr uint32_t MEGA_MOE_COMM_LOCAL_PARTIAL_TP4 = 3;
 
 struct MegaMoeA2A3TilingData {
     uint32_t M;

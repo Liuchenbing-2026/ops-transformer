@@ -269,6 +269,9 @@ static int64_t MaxBatchSizeForCommAlg(const gert::TilingContext *context)
 {
     auto attrs = context->GetAttrs();
     auto alg = attrs == nullptr ? nullptr : attrs->GetAttrPointer<char>(ATTR_COMM_ALG_INDEX);
+    if (alg != nullptr && strcmp(alg, "local_partial_tp4") == 0) {
+        return 8192 + 32;
+    }
     return alg != nullptr && strcmp(alg, "replicated_dispatch") == 0 ? MAX_BS + 32 : MAX_BS;
 }
 
@@ -1203,8 +1206,23 @@ static ge::graphStatus MegaMoeA2A3CommAlg(const gert::TilingContext *context, Me
             return ge::GRAPH_FAILED;
         }
         info.commAlgCode = MEGA_MOE_COMM_REPLICATED_DISPATCH;
+    } else if (strcmp(commAlg, "local_partial_tp4") == 0) {
+        auto desc = context->GetInputDesc(X_INDEX);
+        auto probsDesc = context->GetInputDesc(TOPK_WEIGHTS_INDEX);
+        if (desc == nullptr || desc->GetDataType() != ge::DT_BF16 ||
+            probsDesc == nullptr || probsDesc->GetDataType() != ge::DT_FLOAT ||
+            info.dispatchQuantMode != 0 || info.combineQuantMode != 0 ||
+            mc2tiling::GetSocVersion(context) != "Ascend910B" || info.worldSize != 4 ||
+            info.expertPerRank != 64 || info.K != 2048 || info.N != 1024 || info.topK != 8 ||
+            info.aivNum != 40 || info.M < 1 || info.M > 8192 + 32 ||
+            info.maxRecvTokenNum < static_cast<uint64_t>(info.M) * info.topK) {
+            OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg,
+                "A2 BF16 EP4 E256/H2048/I512/K8, full replicated input <=8224, full routed-row capacity");
+            return ge::GRAPH_FAILED;
+        }
+        info.commAlgCode = MEGA_MOE_COMM_LOCAL_PARTIAL_TP4;
     } else if (strlen(commAlg) > 0) {
-        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg, "empty string or replicated_dispatch");
+        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg, "empty string, replicated_dispatch or local_partial_tp4");
         return ge::GRAPH_FAILED;
     }
 
