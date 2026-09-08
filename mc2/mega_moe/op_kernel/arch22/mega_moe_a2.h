@@ -218,7 +218,10 @@ __aicore__ inline void MegaMoeA2<MegaMoeFuncA2>::Process()
 {
     using ArchTag = Arch::AtlasA2;
     constexpr bool enableUnitFlag = false;
-    constexpr bool enableShuffleK = true;
+    // BF16 rounds the accumulated GEMM result before activation and combine.
+    // Keep its A2 K traversal independent of the core that owns the output tile.
+    constexpr bool enableShuffleK =
+        !(IS_A2_ && std::is_same_v<AType_, bfloat16_t> && std::is_same_v<BType_, bfloat16_t>);
     constexpr bool isW4A8 = std::is_same_v<BType_, AscendC::int4b_t>;
     constexpr bool isInt8 = std::is_same_v<BType_, int8_t>;
 
