@@ -1151,7 +1151,8 @@ private:
                 shmem.windowsOutAddr() + peermemInfo.offsetWinOutA) +
                 src * shardRows * params.problemShape.k());
             for (uint32_t wave = 0; wave < params.expertPerRank; wave += dispatchExpertsPerWave) {
-                const uint32_t end = min(wave + dispatchExpertsPerWave, params.expertPerRank);
+                const uint32_t end =
+                    min(wave + dispatchExpertsPerWave, static_cast<uint32_t>(params.expertPerRank));
                 const uint32_t expert = wave + lane;
                 uint32_t row = prevGroupSum2;
                 for (uint32_t e = wave; e < min(expert, end); ++e) {
