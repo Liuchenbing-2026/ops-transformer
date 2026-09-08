@@ -1003,6 +1003,44 @@ private:
     }
 
     CATLASS_DEVICE
+    void MaskReplicatedUnpermuteIndices(Params const &params)
+    {
+        if (params.ptrXActiveMask == nullptr) {
+            return;
+        }
+        const uint32_t rank = RuntimeRank(params);
+        const uint32_t m = params.problemShape.m();
+        const uint32_t slots = m * params.topK;
+        const uint32_t begin = slots * coreIdx / coreNum;
+        const uint32_t end = slots * (coreIdx + 1) / coreNum;
+        const uint32_t count = end - begin;
+        if (count == 0) {
+            return;
+        }
+        AscendC::GlobalTensor<int32_t> indices;
+        indices.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(workspaceInfo.expandedRowIdx) +
+                                rank * AlignUp(m, 256) * params.topK);
+        AscendC::LocalTensor<int32_t> local = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+        AscendC::DataCopyPad(local, indices[begin],
+                            {1, static_cast<uint16_t>(count * sizeof(int32_t)), 0, 0}, {});
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!gmXActiveMask(rank * m + (begin + i) / params.topK)) {
+                // The unchanged unpermute skips indices >= num_out_tokens.
+                // Define inactive output without reading unwritten combine rows.
+                local.SetValue(i, slots);
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+        AscendC::DataCopyPad(indices[begin], local,
+                            {1, static_cast<uint16_t>(count * sizeof(int32_t)), 0, 0, 0});
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+    }
+
+    CATLASS_DEVICE
     void RouteReplicatedSourceShards(Params const &params)
     {
         const uint32_t rank = RuntimeRank(params);
@@ -1029,6 +1067,7 @@ private:
                 &params.moeInitRoutingV2TilingData, params.initRoutingQuantTilingKey);
             AscendC::SyncAll<true>();
         }
+        MaskReplicatedUnpermuteIndices(params);
         // Recreate the ordinary [source, destination, expert] counts and
         // combine prefixes locally. Each source owns a disjoint metadata row.
         if (coreIdx < params.EP) {
