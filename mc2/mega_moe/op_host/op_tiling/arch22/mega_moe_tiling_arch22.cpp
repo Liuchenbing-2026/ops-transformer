@@ -1495,8 +1495,12 @@ static ge::graphStatus MegaMoeA2A3TilingFuncImpl(gert::TilingContext *context)
     // routing call. Its temporary workspace starts after both buffers.
     const uint64_t routingIndexBytes = (routingM + 255) / 256 * 256 * info.topK * sizeof(int32_t);
     const uint64_t extraIndexBytes = replicatedDispatch ? 256UL * info.topK * sizeof(int32_t) : 0;
+    // One 64-byte cache line per AIC for monotonic expert-ready progress.
+    // Existing BF16 workspace padding can be only 640 bytes on EP2, so it
+    // cannot safely contain all 20 slots without this explicit reservation.
+    const uint64_t combineReadyBytes = replicatedDispatch ? (info.aivNum / 2) * 64UL : 0;
     workSpaces[0] = SYSTEM_NEED_WORKSPACE +
-        std::max(megeMoeWorkspace + extraIndexBytes,
+        std::max(megeMoeWorkspace + extraIndexBytes + combineReadyBytes,
                  initRoutingWorkspace + (replicatedDispatch ? 2 * routingIndexBytes : 0));
 
     OP_LOGI(K_INNER_DEBUG, "Leave MegaMoeA2A3 tiling func.");

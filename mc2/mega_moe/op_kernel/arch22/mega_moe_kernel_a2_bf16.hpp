@@ -1497,8 +1497,104 @@ private:
     }
 
     CATLASS_DEVICE
+    void CombineExpertReadyEP2(Params const &params, BlockEpilogue2 &blockEpilogue)
+    {
+        const int32_t rank = RuntimeRank(params);
+        const uint32_t aicCoreNum = coreNum / 2;
+        const uint32_t aicCoreIdx = get_block_idx();
+        const uint32_t peer = get_subblockid();
+        const uint32_t n2 = params.problemShape.k();
+        const uint32_t k2 = params.problemShape.n() / 2;
+        constexpr uint32_t readySlotInts = 64 / sizeof(int32_t);
+        __gm__ int32_t *readyBase = reinterpret_cast<__gm__ int32_t *>(workspaceInfo.ptrSoftFlagBase);
+
+        // Consume CombineSetFlag's two credits before the self-contained
+        // CopyGMToGM helper reuses those event IDs. Every helper call drains.
+        blockEpilogue.Finalize();
+        if (peer == 0) {
+            __gm__ int32_t *ownReady = readyBase + aicCoreIdx * readySlotInts;
+            gm_store(ownReady, 0);
+            gm_dcci((__gm__ uint8_t *)ownReady);
+        }
+        // A prior invocation may have left larger progress values. Every
+        // cache-line owner must finish resetting before any publication.
+        AscendC::SyncAll<true>();
+
+        AscendC::GlobalTensor<ElementD2> destination;
+        destination.SetGlobalBuffer(reinterpret_cast<__gm__ ElementD2 *>(shmem(peermemInfo.offsetD, peer)));
+        BlockScheduler blockScheduler;
+        int32_t syncLoopIdx = 0;
+        uint32_t startCoreIdx = 0;
+        uint32_t sourceBase = 0;
+        for (uint32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
+            uint32_t currentExpertM = cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, groupIdx));
+            currentExpertM = sourceBase >= params.maxOutputSize ? 0 :
+                min(currentExpertM, params.maxOutputSize - sourceBase);
+            GemmCoord inGroupProblemShape{currentExpertM, n2, k2};
+            blockScheduler.Update(inGroupProblemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
+            const uint32_t coreLoops = blockScheduler.GetCoreLoops();
+            const uint32_t startLoopIdx =
+                ((aicCoreIdx < startCoreIdx) ? aicCoreIdx + aicCoreNum : aicCoreIdx) - startCoreIdx;
+
+            if (startLoopIdx < coreLoops) {
+                // Preserve the original paired-AIC flag consumption, including
+                // skipped groups. PIPE_S waits precede the scalar publication.
+                for (; syncLoopIdx <= groupIdx; ++syncLoopIdx) {
+                    const int32_t flagId = syncLoopIdx / CROSS_CORE_FLAG_MAX_SET_COUNT;
+                    AscendC::CrossCoreWaitFlag<0x2>(flagId);
+                }
+                if (peer == 0) {
+                    __gm__ int32_t *ownReady = readyBase + aicCoreIdx * readySlotInts;
+                    gm_store(ownReady, static_cast<int32_t>(groupIdx + 1));
+                    gm_dcci((__gm__ uint8_t *)ownReady);
+                }
+            }
+
+            // Use one lane per original M tile, capped at the available AIC
+            // pairs. Small experts overlap across lanes; large experts split
+            // full rows across lanes instead of serializing on a single pair.
+            const uint32_t copyLanes = min(aicCoreNum,
+                CeilDiv(currentExpertM, static_cast<uint32_t>(L1TileShape::M)));
+            if (startLoopIdx < copyLanes) {
+                const uint32_t peerStart = peer == 0 ? 0 : tokenPerExpert(tokenPerExpertLayout(0, rank, groupIdx));
+                const uint32_t peerRows = peerStart >= currentExpertM ? 0 :
+                    min(static_cast<uint32_t>(tokenPerExpert(tokenPerExpertLayout(peer, rank, groupIdx))),
+                        currentExpertM - peerStart);
+                const uint32_t begin = static_cast<uint64_t>(peerRows) * startLoopIdx / copyLanes;
+                const uint32_t end = static_cast<uint64_t>(peerRows) * (startLoopIdx + 1) / copyLanes;
+                if (begin < end) {
+                    // Only cores with actual GMM2 work contribute readiness.
+                    // Publish before waiting: dependencies never point to a
+                    // future expert, so slow copy owners cannot form a cycle.
+                    for (uint32_t contributor = 0; contributor < min(coreLoops, aicCoreNum); ++contributor) {
+                        const uint32_t readyCore = (startCoreIdx + contributor) % aicCoreNum;
+                        __gm__ int32_t *flagAddr = readyBase + readyCore * readySlotInts;
+                        while (true) {
+                            gm_dcci(flagAddr);
+                            if (gm_load(flagAddr) >= static_cast<int32_t>(groupIdx + 1)) {
+                                break;
+                            }
+                        }
+                    }
+                    const uint32_t destinationBase = preSumBeforeRankForCombine(peer * params.expertPerRank + groupIdx);
+                    const uint64_t srcOffset = static_cast<uint64_t>(sourceBase + peerStart + begin) * n2;
+                    const uint64_t dstOffset = static_cast<uint64_t>(destinationBase + begin) * n2;
+                    CopyGMToGM(destination[dstOffset], gmC2[srcOffset], (end - begin) * n2, UB_MOVE_NUM);
+                }
+            }
+            sourceBase += currentExpertM;
+            startCoreIdx = (startCoreIdx + coreLoops) % aicCoreNum;
+        }
+    }
+
+    CATLASS_DEVICE
     void CombineV2(Params const &params, BlockEpilogue2 &blockEpilogue)
     {
+        // The host restricts this explicit experimental mode to A2 BF16 EP2.
+        if (params.replicatedDispatch) {
+            CombineExpertReadyEP2(params, blockEpilogue);
+            return;
+        }
         const int32_t rank = RuntimeRank(params);
         BlockScheduler blockScheduler;
         int32_t syncLoopIdx = 0;
