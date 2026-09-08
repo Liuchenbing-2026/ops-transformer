@@ -265,6 +265,13 @@ static ge::graphStatus CheckCombineQuantModeAttr(const int64_t *ptr)
     return ge::GRAPH_SUCCESS;
 }
 
+static int64_t MaxBatchSizeForCommAlg(const gert::TilingContext *context)
+{
+    auto attrs = context->GetAttrs();
+    auto alg = attrs == nullptr ? nullptr : attrs->GetAttrPointer<char>(ATTR_COMM_ALG_INDEX);
+    return alg != nullptr && strcmp(alg, "replicated_dispatch") == 0 ? MAX_BS + 32 : MAX_BS;
+}
+
 // 校验 num_max_tokens_per_rank，需要从 x shape 获取 bs
 static ge::graphStatus CheckNumMaxTokensPerRankAttr(gert::TilingContext *context, const int64_t *ptr)
 {
@@ -278,7 +285,7 @@ static ge::graphStatus CheckNumMaxTokensPerRankAttr(gert::TilingContext *context
                         OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "num_max_tokens_per_rank", std::to_string(*ptr).c_str(),
                                                   (">= bs (" + std::to_string(bs) + ")").c_str()),
                         return GRAPH_FAILED);
-        OP_TILING_CHECK(*ptr < MIN_BS || *ptr > MAX_BS,
+        OP_TILING_CHECK(*ptr < MIN_BS || *ptr > MaxBatchSizeForCommAlg(context),
                         OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "num_max_tokens_per_rank", std::to_string(*ptr).c_str(),
                                                   "in [1, 4096]"),
                         return GRAPH_FAILED);
@@ -610,7 +617,7 @@ static ge::graphStatus CheckXInput(gert::TilingContext *context, const gert::Sto
     int64_t bs = xStorageShape->GetStorageShape().GetDim(0);
     int64_t hiddenSize = xStorageShape->GetStorageShape().GetDim(1);
 
-    OP_TILING_CHECK(bs < MIN_BS || bs > MAX_BS,
+    OP_TILING_CHECK(bs < MIN_BS || bs > MaxBatchSizeForCommAlg(context),
                     OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(K_OP_NAME, "x",
                                                           Ops::Base::ToString(xStorageShape->GetStorageShape()).c_str(),
                                                           "dim0 (bs) must be in [1, 4096]"),
@@ -1169,7 +1176,7 @@ static ge::graphStatus MegaMoeA2A3GetPlatformInfoAndSetTiling(gert::TilingContex
 }
 
 // 表示通信亲和内存布局算法，当前版本仅支持 ""。
-static ge::graphStatus MegaMoeA2A3CommAlg(const gert::TilingContext *context)
+static ge::graphStatus MegaMoeA2A3CommAlg(const gert::TilingContext *context, MegaMoeA2A3TilingData &info)
 {
     auto attrs = context->GetAttrs();
     OP_TILING_CHECK(attrs == nullptr, OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "Failed to get operator attributes."),
@@ -1178,8 +1185,26 @@ static ge::graphStatus MegaMoeA2A3CommAlg(const gert::TilingContext *context)
     OP_TILING_CHECK(commAlg == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", "null", "not null"),
                     return ge::GRAPH_FAILED);
 
-    if (strlen(commAlg) > 0) {
-        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg, "empty string");
+    info.commAlgCode = 0;
+    if (strcmp(commAlg, "replicated_dispatch") == 0) {
+        auto desc = context->GetInputDesc(X_INDEX);
+        auto probsDesc = context->GetInputDesc(TOPK_WEIGHTS_INDEX);
+        // Both input halves have the exact old per-rank ordering, including
+        // masked padding and rank-specific sentinels. Return token ownership,
+        // never a rounded sum of only this rank's experts.
+        if (desc == nullptr || desc->GetDataType() != ge::DT_BF16 ||
+            probsDesc == nullptr || probsDesc->GetDataType() != ge::DT_FLOAT || info.isQuantRouting != 0 ||
+            mc2tiling::GetSocVersion(context) != "Ascend910B" || info.worldSize != 2 ||
+            info.expertPerRank != 128 || info.K != 2048 || info.N != 1024 || info.topK != 8 ||
+            info.aivNum != 40 || info.M % 2 != 0 || info.M < 2 ||
+            info.maxRecvTokenNum < static_cast<uint64_t>(info.M) * info.topK) {
+            OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg,
+                                      "A2 BF16 EP2 E256/H2048/I512/K8, equal source shards, full receive capacity");
+            return ge::GRAPH_FAILED;
+        }
+        info.commAlgCode = MEGA_MOE_COMM_REPLICATED_DISPATCH;
+    } else if (strlen(commAlg) > 0) {
+        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg, "empty string or replicated_dispatch");
         return ge::GRAPH_FAILED;
     }
 
@@ -1320,8 +1345,6 @@ static ge::graphStatus MegaMoeA2A3TilingFuncImpl(gert::TilingContext *context)
     MegaMoeA2A3TilingData &info = tilingData->common;
     OP_LOGI(K_INNER_DEBUG, "MegaMoeA2A3 get tilingData info.");
 
-    OP_TILING_CHECK(MegaMoeA2A3CommAlg(context) != ge::GRAPH_SUCCESS,
-                    OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "MegaMoeA2A3 CheckCommAlg Failed"), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(MegaMoeA2A3CheckShapeAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
                     OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "MegaMoeA2A3 CheckShapeAndSetTiling Failed"),
                     return ge::GRAPH_FAILED);
@@ -1337,6 +1360,9 @@ static ge::graphStatus MegaMoeA2A3TilingFuncImpl(gert::TilingContext *context)
     OP_TILING_CHECK(MegaMoeA2A3CheckHcclBuffSize(context, info) != ge::GRAPH_SUCCESS,
                     OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "MegaMoeA2A3 CheckHcclBuffSize Failed"),
                     return ge::GRAPH_FAILED);
+
+    OP_TILING_CHECK(MegaMoeA2A3CommAlg(context, info) != ge::GRAPH_SUCCESS,
+                    OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "MegaMoeA2A3 CheckCommAlg Failed"), return ge::GRAPH_FAILED);
 
     // 2. set blockDim
     uint32_t blockDim = 1U;
@@ -1379,7 +1405,9 @@ static ge::graphStatus MegaMoeA2A3TilingFuncImpl(gert::TilingContext *context)
     int64_t ubSize = 196352;
     int64_t expertCapacity = 0;
     int64_t expertNum = info.expertPerRank * info.worldSize;
-    int64_t activeNum = info.M * info.topK;
+    const bool replicatedDispatch = info.commAlgCode == MEGA_MOE_COMM_REPLICATED_DISPATCH;
+    const uint32_t routingM = replicatedDispatch ? info.M / 2 : info.M;
+    int64_t activeNum = routingM * info.topK;
     int64_t dropPadMode = 0;
     int64_t expertTokensCountOrCumsumFlag = 2;
     bool expertTokensBeforeCapacityFlag = false;
@@ -1410,7 +1438,7 @@ static ge::graphStatus MegaMoeA2A3TilingFuncImpl(gert::TilingContext *context)
         nonQuantTilingData->common = info;
 
         MoeInitRoutingV2TilingBase moeInitRoutingV2TilingBase;
-        moeInitRoutingV2TilingBase.DoTiling(info.M, info.K, info.topK, expertCapacity, expertNum, activeNum,
+        moeInitRoutingV2TilingBase.DoTiling(routingM, info.K, info.topK, expertCapacity, expertNum, activeNum,
                                             dropPadMode, expertTokensCountOrCumsumFlag, expertTokensBeforeCapacityFlag,
                                             inuptXDtypeSize, quantModeRouting, scaleDim0, aivNum, ubSize);
         initRoutingQuantTilingKey = moeInitRoutingV2TilingBase.tilingKey_;
@@ -1463,7 +1491,13 @@ static ge::graphStatus MegaMoeA2A3TilingFuncImpl(gert::TilingContext *context)
         }
     }
 
-    workSpaces[0] = SYSTEM_NEED_WORKSPACE + std::max(megeMoeWorkspace, initRoutingWorkspace);
+    // Two separately aligned expanded-index buffers survive the second
+    // routing call. Its temporary workspace starts after both buffers.
+    const uint64_t routingIndexBytes = (routingM + 255) / 256 * 256 * info.topK * sizeof(int32_t);
+    const uint64_t extraIndexBytes = replicatedDispatch ? 256UL * info.topK * sizeof(int32_t) : 0;
+    workSpaces[0] = SYSTEM_NEED_WORKSPACE +
+        std::max(megeMoeWorkspace + extraIndexBytes,
+                 initRoutingWorkspace + (replicatedDispatch ? 2 * routingIndexBytes : 0));
 
     OP_LOGI(K_INNER_DEBUG, "Leave MegaMoeA2A3 tiling func.");
     return ge::GRAPH_SUCCESS;

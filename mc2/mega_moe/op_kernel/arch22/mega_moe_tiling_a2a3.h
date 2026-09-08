@@ -33,6 +33,10 @@ using namespace Mc2Tiling;
 #define SOC_ASCEND910B 0
 #define SOC_ASCEND910_93 1
 
+// Full inputs contain source-0 then source-1 shards, including their sentinels.
+// Output owns one token shard (the other is zero); arithmetic/combination is unchanged.
+constexpr uint32_t MEGA_MOE_COMM_REPLICATED_DISPATCH = 2;
+
 struct MegaMoeA2A3TilingData {
     uint32_t M;
     uint32_t K;

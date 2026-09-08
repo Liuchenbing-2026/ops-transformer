@@ -130,6 +130,7 @@ private:
     int32_t epWorldSize_;
     int32_t listLen_;
     uint32_t activationCode_;
+    uint32_t commAlgCode_{0};
     float activationClamp_;
     float activationParams1_;
     float activationParams2_;
@@ -207,6 +208,7 @@ MegaMoeA2<MegaMoeFuncA2>::Init(GM_ADDR contextGM, GM_ADDR xGM, GM_ADDR topkIdsGM
         activationParams2_ = tilingData.common.activationParams2;
 
         moeInitRoutingV2TilingData = tilingData.moeInitRoutingV2TilingData;
+        commAlgCode_ = tilingData.common.commAlgCode;
         initRoutingQuantTilingKey = tilingData.common.initRoutingQuantTilingKey;
     }
 }
@@ -467,6 +469,11 @@ __aicore__ inline void MegaMoeA2<MegaMoeFuncA2>::Process()
                                               activationParams2_,
                                               tilingGM_};
 
+        params.replicatedDispatch = commAlgCode_ == MEGA_MOE_COMM_REPLICATED_DISPATCH;
+        if (params.replicatedDispatch) {
+            params.problemShape = GemmCoord{static_cast<uint32_t>(m_ / 2),
+                                            static_cast<uint32_t>(n_), static_cast<uint32_t>(k_)};
+        }
         MatmulKernel kernel(params);
         kernel(params);
     }

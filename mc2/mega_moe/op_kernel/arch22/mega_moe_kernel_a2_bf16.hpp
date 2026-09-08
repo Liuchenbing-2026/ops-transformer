@@ -115,6 +115,7 @@ public:
         uint32_t epilogueGranularity{0};
         float swigluLimit;
         uint32_t activationCode{0};
+        bool replicatedDispatch{false};
         float activationParams1{Epilogue::SwigluOaiActivation::DEFAULT_ALPHA};
         float activationParams2{Epilogue::SituActivation::DEFAULT_BETA};
         GM_ADDR contextGM{nullptr};
@@ -1002,6 +1003,85 @@ private:
     }
 
     CATLASS_DEVICE
+    void RouteReplicatedSourceShards(Params const &params)
+    {
+        const uint32_t rank = RuntimeRank(params);
+        const uint64_t m = params.problemShape.m();
+        const uint64_t h = params.problemShape.k();
+        const uint64_t indexBytes = AlignUp(m, 256) * params.topK * sizeof(int32_t);
+        // Apply the mask to both independently supplied source shards.
+        Params fullParams = params;
+        fullParams.problemShape = GemmCoord{static_cast<uint32_t>(2 * m),
+                                            params.problemShape.n(), params.problemShape.k()};
+        ApplyXActiveMask(fullParams);
+        for (uint32_t src = 0; src < params.EP; ++src) {
+            // The unchanged per-shard tiler and input order preserve sorting,
+            // sentinels, tile/core ownership, and therefore shuffled K order.
+            moe_init_routing_v2<ElementA>(
+                reinterpret_cast<GM_ADDR>(params.ptrA) + src * m * h * sizeof(ElementA),
+                params.expertIdx + src * m * params.topK * sizeof(int32_t),
+                shmem.windowsOutAddr() + peermemInfo.offsetWinOutA +
+                    src * m * params.topK * h * sizeof(ElementA),
+                workspaceInfo.expandedRowIdx + src * indexBytes,
+                shmem.windowsOutAddr() + peermemInfo.offsetPeerTokenPerExpert +
+                    tokenPerExpertLayout(src, 0, 0) * sizeof(int32_t),
+                params.expertTokensBeforeCapacity, params.ptrWorkspace + 2 * indexBytes,
+                &params.moeInitRoutingV2TilingData, params.initRoutingQuantTilingKey);
+            AscendC::SyncAll<true>();
+        }
+        // Recreate the ordinary [source, destination, expert] counts and
+        // combine prefixes locally. Each source owns a disjoint metadata row.
+        if (coreIdx < params.EP) {
+            const uint32_t src = coreIdx;
+            AscendC::GlobalTensor<int32_t> source;
+            source.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(
+                shmem.windowsOutAddr() + peermemInfo.offsetPeerTokenPerExpert) +
+                tokenPerExpertLayout(src, 0, 0));
+            CopyGMToGM(tokenPerExpert[tokenPerExpertLayout(src, 0, 0)], source,
+                       paddedExpertNumAligned, UB_MOVE_NUM);
+            AscendC::LocalTensor<int32_t> counts = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+            AscendC::LocalTensor<int32_t> prefix = counts[paddedExpertNumAligned];
+            AscendC::DataCopy(counts, source, paddedExpertNumAligned);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            uint32_t sum = 0;
+            for (uint32_t expert = 0; expert < params.EP * params.expertPerRank; ++expert) {
+                prefix(expert) = sum;
+                sum += counts(expert);
+            }
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::DataCopy(preSumBeforeRankForCombine[src * params.expertPerRank],
+                             prefix[rank * params.expertPerRank], params.expertPerRank);
+            if (src == rank) {
+                AscendC::DataCopy(preSumBeforeRankForDispatch, prefix, params.EP * params.expertPerRank);
+            }
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        AscendC::SyncAll<true>();
+        // A token has exactly one full routed contribution in the caller's TP
+        // sum. Define the opposite output shard as zero (no partial rounding).
+        constexpr uint32_t zeroInts = 8192;
+        AscendC::LocalTensor<int32_t> zeros = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+        AscendC::Duplicate(zeros, 0, zeroInts);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::GlobalTensor<int32_t> output;
+        output.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.ptrOutput) +
+                              (1 - rank) * m * h * sizeof(ElementD2) / sizeof(int32_t));
+        const uint64_t width = h * sizeof(ElementD2) / sizeof(int32_t);
+        const uint64_t end = m * (coreIdx + 1) / coreNum * width;
+        for (uint64_t i = m * coreIdx / coreNum * width; i < end; i += zeroInts) {
+            const uint32_t size = static_cast<uint32_t>(min(static_cast<uint64_t>(zeroInts), end - i));
+            AscendC::DataCopy(output[i], zeros, size);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        AscendC::SyncAll<true>();
+    }
+
+    CATLASS_DEVICE
     void DispatchAndCombine(Params const &params)
     {
         const int32_t rank = RuntimeRank(params);
@@ -1016,19 +1096,23 @@ private:
             shmem.windowsOutAddr() + localTokenPerExpertOffset; // Place the entire communication matrix in peermem
         uint32_t expandedRowIdxOffset = AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t);
 
-        exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::APPLY_XACTIVE_MASK);
-        ApplyXActiveMask(params);
+        if (params.replicatedDispatch) {
+            RouteReplicatedSourceShards(params);
+        } else {
+            exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::APPLY_XACTIVE_MASK);
+            ApplyXActiveMask(params);
 
-        exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::MOE_INIT_ROUTING);
-        moe_init_routing_v2<ElementA>(reinterpret_cast<GM_ADDR>(params.ptrA), params.expertIdx,
-                                      shmem.windowsOutAddr() + peermemInfo.offsetWinOutA, workspaceInfo.expandedRowIdx,
-                                      localTokenPerExpert, params.expertTokensBeforeCapacity,
-                                      params.ptrWorkspace + expandedRowIdxOffset, &params.moeInitRoutingV2TilingData,
-                                      params.initRoutingQuantTilingKey);
+            exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::MOE_INIT_ROUTING);
+            moe_init_routing_v2<ElementA>(reinterpret_cast<GM_ADDR>(params.ptrA), params.expertIdx,
+                                          shmem.windowsOutAddr() + peermemInfo.offsetWinOutA, workspaceInfo.expandedRowIdx,
+                                          localTokenPerExpert, params.expertTokensBeforeCapacity,
+                                          params.ptrWorkspace + expandedRowIdxOffset, &params.moeInitRoutingV2TilingData,
+                                          params.initRoutingQuantTilingKey);
 
-        AscendC::SyncAll<true>();
-        exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::ALLGATHER_TOKEN_PER_EXPERT);
-        CrossRankSyncAndlocalTokenPerExpertAllGatherAndGetSumPreRankV2(params, localTokenPerExpertOffset);
+            AscendC::SyncAll<true>();
+            exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::ALLGATHER_TOKEN_PER_EXPERT);
+            CrossRankSyncAndlocalTokenPerExpertAllGatherAndGetSumPreRankV2(params, localTokenPerExpertOffset);
+        }
 
         if (coreIdx == 0) {
             exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::CUMSUM_TOKEN_PER_EXPERT);
@@ -1056,7 +1140,47 @@ private:
         icache_preload(8);
         exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::DISPATCH);
         constexpr uint32_t dispatchExpertsPerWave = 20;
-        if (params.EP == 2 && coreNum == 2 * dispatchExpertsPerWave) {
+        if (params.replicatedDispatch) {
+            // Same destination rows and wave readiness as ordinary EP2. Both
+            // source-shard routes live in this rank's local output window.
+            const uint32_t src = coreIdx % params.EP;
+            const uint32_t lane = coreIdx / params.EP;
+            const uint64_t shardRows = static_cast<uint64_t>(params.problemShape.m()) * params.topK;
+            AscendC::GlobalTensor<ElementA> routed;
+            routed.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                shmem.windowsOutAddr() + peermemInfo.offsetWinOutA) +
+                src * shardRows * params.problemShape.k());
+            for (uint32_t wave = 0; wave < params.expertPerRank; wave += dispatchExpertsPerWave) {
+                const uint32_t end = min(wave + dispatchExpertsPerWave, params.expertPerRank);
+                const uint32_t expert = wave + lane;
+                uint32_t row = prevGroupSum2;
+                for (uint32_t e = wave; e < min(expert, end); ++e) {
+                    row += cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, e));
+                }
+                if (expert < end) {
+                    row += src == 0 ? 0 : cumsumMM(tokenPerExpertLayout(src - 1, rank, expert));
+                    const uint32_t count = tokenPerExpert(tokenPerExpertLayout(src, rank, expert));
+                    const uint32_t from = preSumBeforeRankForCombine(src * params.expertPerRank + expert);
+                    if (count > 0) {
+                        CopyGMToGM(gmA[static_cast<uint64_t>(row) * params.problemShape.k()],
+                                   routed[static_cast<uint64_t>(from) * params.problemShape.k()],
+                                   count * params.problemShape.k(), UB_MOVE_NUM);
+                    }
+                }
+                AscendC::SyncAll<true>();
+                for (uint32_t e = wave; e < end; ++e) {
+                    const uint32_t count = cumsumMM(tokenPerExpertLayout(params.EP - 1, rank, e));
+                    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                    ++syncgmm1Idx;
+                    if (e + 1 <= params.epilogueGranularity) {
+                        dequantSum1 += count;
+                    } else {
+                        dequantSum2 += count;
+                    }
+                    prevGroupSum2 += count;
+                }
+            }
+        } else if (params.EP == 2 && coreNum == 2 * dispatchExpertsPerWave) {
             // EP2 maps each pair of AIV cores to one expert. All twenty
             // experts have disjoint peer-memory rows and dispatch flag slots.
             // Keep send/receive phases separate; notify GMM1 in expert order
@@ -1320,8 +1444,14 @@ private:
             MoeTokenUnpermuteTilingData tilingData;
             MoeTokenUnpermuteTiling(params.problemShape.m() * params.topK, n2, params.topK, tilingData, coreNum / 2);
             KernelMoeTokenUnpermute<ElementD2, int32_t, float, true> kernelMoeTokenUnpermuteOp;
-            kernelMoeTokenUnpermuteOp.Init(shmem() + peermemInfo.offsetD, workspaceInfo.expandedRowIdx, params.probs,
-                                           reinterpret_cast<GM_ADDR>(params.ptrOutput), &tilingData);
+            const uint64_t outputRow = params.replicatedDispatch ? rank * params.problemShape.m() : 0;
+            const uint64_t indexOffset = params.replicatedDispatch ?
+                rank * AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t) : 0;
+            kernelMoeTokenUnpermuteOp.Init(shmem() + peermemInfo.offsetD,
+                                           workspaceInfo.expandedRowIdx + indexOffset,
+                                           params.probs + outputRow * params.topK * sizeof(float),
+                                           reinterpret_cast<GM_ADDR>(params.ptrOutput) +
+                                               outputRow * n2 * sizeof(ElementD2), &tilingData);
             kernelMoeTokenUnpermuteOp.Process();
         }
     }
@@ -1468,7 +1598,8 @@ private:
             uint32_t n2 = params.problemShape.k();
             uint64_t workspaceOffset = 0;
             expandedRowIdx = params.ptrWorkspace;
-            workspaceOffset += AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t);
+            workspaceOffset += AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t) *
+                               (params.replicatedDispatch ? 2 : 1);
 
             uint64_t paddedExpertNumAligned = AlignUp(params.EP * params.expertPerRank + 1, ALIGN_128);
             ptrcumsumMM = params.ptrWorkspace + workspaceOffset;
@@ -1553,7 +1684,8 @@ private:
 
             // WinOut: A/D 从前向后布局（winIn == winOut，flag/TPE offset 复用 winIn）
             // ABeforeDispatchSize: dispatch 发送数据区（BF16，无 perTokenScale），原始token
-            int64_t ABeforeDispatchSize = bs * topK * h * sizeof(int16_t);
+            int64_t ABeforeDispatchSize = bs * topK * h * sizeof(int16_t) *
+                                          (params.replicatedDispatch ? 2 : 1);
             offsetWinOutA = RESERVED_SPACE_SIZE;
             offsetWinOutD = offsetWinOutA + ABeforeDispatchSize;
         }
