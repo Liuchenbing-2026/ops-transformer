@@ -47,7 +47,8 @@ template <class DTYPE_X = bfloat16_t>
 __aicore__ inline void moe_init_routing_v2(GM_ADDR x, GM_ADDR expertIdx, GM_ADDR expandedX, GM_ADDR expandedRowIdx,
                                            GM_ADDR expertTokensCountOrCumsum, GM_ADDR expertTokensBeforeCapacity,
                                            GM_ADDR workspace, const MoeInitRoutingV2TilingData *tilingData,
-                                           uint64_t tilingKey)
+                                           uint64_t tilingKey, int32_t ownedExpertStart = 0,
+                                           int32_t ownedExpertCount = 0)
 {
     if (g_coreType == AIC) {
         return;
@@ -121,6 +122,24 @@ __aicore__ inline void moe_init_routing_v2(GM_ADDR x, GM_ADDR expertIdx, GM_ADDR
     TPipe gatherPipe;
     MoeInitRoutingV2::MoeV2GatherOut<DTYPE_X> gatherOp;
     gatherOp.Init(x, expandedRowIdx, expandedX, userWS, tilingData, &gatherPipe);
+#ifndef __DAV_C310__
+    if (ownedExpertCount > 0 && tilingData->expertTokensCountOrCumsumFlag == 2) {
+        // The count output and src-to-dst indices must be visible to every
+        // gather core. Count mode is fixed by the A2 MegaMoe host tiling.
+        AscendC::SyncAll<true>();
+        AscendC::GlobalTensor<int32_t> counts;
+        counts.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(expertTokensCountOrCumsum));
+        int64_t firstRow = 0;
+        for (int32_t expert = 0; expert < ownedExpertStart; ++expert) {
+            firstRow += counts(expert);
+        }
+        int64_t lastRow = firstRow;
+        for (int32_t expert = ownedExpertStart; expert < ownedExpertStart + ownedExpertCount; ++expert) {
+            lastRow += counts(expert);
+        }
+        gatherOp.SetOwnedRows(firstRow, lastRow);
+    }
+#endif
     gatherOp.Process();
     gatherPipe.Destroy();
 }

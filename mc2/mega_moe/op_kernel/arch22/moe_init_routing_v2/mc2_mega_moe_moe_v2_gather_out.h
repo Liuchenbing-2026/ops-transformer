@@ -33,6 +33,11 @@ public:
     __aicore__ inline void Init(GM_ADDR inputX, GM_ADDR expandedRowIdx, GM_ADDR expandedX, GM_ADDR workspace,
                                 const MoeInitRoutingV2TilingData *tilingData, TPipe *tPipe);
     __aicore__ inline void Process();
+    __aicore__ inline void SetOwnedRows(int64_t begin, int64_t end)
+    {
+        ownedRowBegin = begin;
+        ownedRowEnd = end;
+    }
 
 private:
     __aicore__ inline void CopyInIndices(int64_t progress);
@@ -55,6 +60,8 @@ private:
     int64_t n;
     int64_t k;
     int64_t activateRows;
+    int64_t ownedRowBegin{0};
+    int64_t ownedRowEnd{-1};
     int64_t currentLoopRows;
     int64_t coreRows;
     int64_t perLoopRows;
@@ -119,6 +126,12 @@ __aicore__ inline void MoeV2GatherOut<T>::CopyOut(int64_t progress)
                 curLoopRow++;
                 initialRow++;
                 if (outIndex == -1 || (this->dropPadMode == DROPLESS_MODE && outIndex >= this->activateRows)) {
+                    continue;
+                }
+                // Local-partial MoE consumes only this rank's sorted expert
+                // interval. Preserve indices and offsets, but omit payloads
+                // belonging to experts that this rank never computes.
+                if (ownedRowEnd >= 0 && (outIndex < ownedRowBegin || outIndex >= ownedRowEnd)) {
                     continue;
                 }
                 outOffset = outIndex * cols + colsLoop * this->perLoopCols;

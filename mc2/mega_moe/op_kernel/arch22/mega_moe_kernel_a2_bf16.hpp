@@ -1161,7 +1161,9 @@ private:
                                           shmem.windowsOutAddr() + peermemInfo.offsetWinOutA, workspaceInfo.expandedRowIdx,
                                           localTokenPerExpert, params.expertTokensBeforeCapacity,
                                           params.ptrWorkspace + expandedRowIdxOffset, &params.moeInitRoutingV2TilingData,
-                                          params.initRoutingQuantTilingKey);
+                                          params.initRoutingQuantTilingKey,
+                                          params.localPartial ? rank * params.expertPerRank : 0,
+                                          params.localPartial ? params.expertPerRank : 0);
 
             AscendC::SyncAll<true>();
             exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::ALLGATHER_TOKEN_PER_EXPERT);
