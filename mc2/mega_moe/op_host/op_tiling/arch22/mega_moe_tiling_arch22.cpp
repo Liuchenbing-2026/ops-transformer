@@ -920,6 +920,45 @@ static ge::graphStatus CheckWeight2Input(gert::TilingContext *context, int64_t h
     return ge::GRAPH_SUCCESS;
 }
 
+// Packed weights retain the existing per-expert matrix layout in one ND
+// allocation. Only the already bounded local TP4 BF16 contract may use this
+// representation; distributed and quantized modes keep their 2D tensor lists.
+constexpr uint32_t LOCAL_PACKED_EXPERTS = 64;
+constexpr uint32_t LOCAL_PACKED_HIDDEN = 2048;
+constexpr uint32_t LOCAL_PACKED_GATED_INTERMEDIATE = 1024;
+
+static ge::graphStatus CheckPackedLocalWeights(gert::TilingContext *context, int64_t hiddenSize)
+{
+    const auto *attrs = context->GetAttrs();
+    const auto *algorithm = attrs == nullptr ? nullptr : attrs->GetAttrPointer<char>(ATTR_COMM_ALG_INDEX);
+    OP_TILING_CHECK(algorithm == nullptr || strcmp(algorithm, "local_partial_tp4") != 0 ||
+                        hiddenSize != LOCAL_PACKED_HIDDEN,
+                    OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG,
+                        "Packed weights require local_partial_tp4 with hidden_size=2048."), return GRAPH_FAILED);
+    const uint32_t indices[] = {WEIGHT1_INDEX, WEIGHT2_INDEX};
+    const int64_t rows[] = {LOCAL_PACKED_HIDDEN, LOCAL_PACKED_GATED_INTERMEDIATE / 2};
+    const int64_t columns[] = {LOCAL_PACKED_GATED_INTERMEDIATE, LOCAL_PACKED_HIDDEN};
+    for (uint32_t i = 0; i < 2; ++i) {
+        const auto *tensor = context->GetDynamicInputTensor(indices[i], 0);
+        const auto *desc = context->GetDynamicInputDesc(indices[i], 0);
+        OP_TILING_CHECK(GetDynamicInputTensorListLen(context, indices[i]) != 1 || tensor == nullptr ||
+                            desc == nullptr || desc->GetDataType() != ge::DT_BF16 ||
+                            ge::GetPrimaryFormat(desc->GetStorageFormat()) != ge::FORMAT_ND,
+                        OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG,
+                            "Each packed local weight must be a single BF16 ND tensor."), return GRAPH_FAILED);
+        const auto &shape = tensor->GetStorageShape();
+        const auto &origin = tensor->GetOriginShape();
+        OP_TILING_CHECK(shape.GetDimNum() != THREE_DIMS || origin.GetDimNum() != THREE_DIMS ||
+                            shape.GetDim(0) != LOCAL_PACKED_EXPERTS || shape.GetDim(1) != rows[i] ||
+                            shape.GetDim(2) != columns[i] || origin.GetDim(0) != LOCAL_PACKED_EXPERTS ||
+                            origin.GetDim(1) != rows[i] || origin.GetDim(2) != columns[i],
+                        OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG,
+                            "Packed local weights require [64,2048,1024] and [64,512,2048] ND shapes."),
+                        return GRAPH_FAILED);
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
 // 校验 weight_scales1/weight_scales2 输入（可选），quant 权重时必选
 static ge::graphStatus CheckWeightScaleInput(gert::TilingContext *context, uint32_t inputIndex, const char *inputName,
                                              uint32_t expertPerRank, int64_t dim1Expected, const char *dim1Name)
@@ -1051,8 +1090,19 @@ static ge::graphStatus MegaMoeA2A3CheckShapeAndSetTiling(gert::TilingContext *co
     uint32_t expertPerRank = 0;
     ge::DataType w1DataType = ge::DT_UNDEFINED;
     ge::Format w1Format = ge::FORMAT_RESERVED;
-    OP_TILING_CHECK(CheckWeight1Input(context, hiddenSize, N, expertPerRank, w1DataType, w1Format) != ge::GRAPH_SUCCESS,
-                    OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "CheckWeight1Input failed."), return GRAPH_FAILED);
+    const auto *firstWeight = context->GetDynamicInputTensor(WEIGHT1_INDEX, 0);
+    const bool packedWeights = firstWeight != nullptr && firstWeight->GetOriginShape().GetDimNum() == THREE_DIMS;
+    if (packedWeights) {
+        OP_TILING_CHECK(CheckPackedLocalWeights(context, hiddenSize) != ge::GRAPH_SUCCESS,
+                        OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "CheckPackedLocalWeights failed."), return GRAPH_FAILED);
+        N = LOCAL_PACKED_GATED_INTERMEDIATE;
+        expertPerRank = LOCAL_PACKED_EXPERTS;
+        w1DataType = ge::DT_BF16;
+        w1Format = ge::FORMAT_ND;
+    } else {
+        OP_TILING_CHECK(CheckWeight1Input(context, hiddenSize, N, expertPerRank, w1DataType, w1Format) != ge::GRAPH_SUCCESS,
+                        OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "CheckWeight1Input failed."), return GRAPH_FAILED);
+    }
 
     info.isQuantRouting = (w1DataType == ge::DT_FLOAT16 || w1DataType == ge::DT_BF16) ? 0U : 1U;
     info.isW4A8 = (w1DataType == ge::DT_INT32 || w1DataType == ge::DT_INT4) ? 1U : 0U;
@@ -1064,9 +1114,13 @@ static ge::graphStatus MegaMoeA2A3CheckShapeAndSetTiling(gert::TilingContext *co
 
     // ==================== 7. weight2 输入校验 ====================
     ge::DataType w2DataType = ge::DT_UNDEFINED;
-    OP_TILING_CHECK(
-        CheckWeight2Input(context, hiddenSize, N, expertPerRank, w1DataType, w1Format, w2DataType) != ge::GRAPH_SUCCESS,
-        OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "CheckWeight2Input failed."), return GRAPH_FAILED);
+    if (packedWeights) {
+        w2DataType = ge::DT_BF16;
+    } else {
+        OP_TILING_CHECK(
+            CheckWeight2Input(context, hiddenSize, N, expertPerRank, w1DataType, w1Format, w2DataType) != ge::GRAPH_SUCCESS,
+            OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "CheckWeight2Input failed."), return GRAPH_FAILED);
+    }
 
     // ==================== 量化权重必须提供 scale 校验 ====================
     // 当 weight1 和 weight2 的类型都为 INT8 或 INT4 时，GMM1/GMM2 需要进行反量化
@@ -1150,7 +1204,7 @@ static ge::graphStatus MegaMoeA2A3CheckShapeAndSetTiling(gert::TilingContext *co
     info.K = static_cast<uint32_t>(hiddenSize);
     info.expertPerRank = expertPerRank;
     info.topK = static_cast<uint32_t>(topK);
-    info.listLen = expertPerRank;
+    info.listLen = packedWeights ? 1 : expertPerRank;
 
     OP_LOGD(K_INNER_DEBUG, "bs=%u", info.M);
     OP_LOGD(K_INNER_DEBUG, "K=%u", info.K);

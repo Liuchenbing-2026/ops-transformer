@@ -40,6 +40,20 @@ NpuMegaMoe(const at::Tensor &context, const at::Tensor &x, const at::Tensor &top
                     (topkIds.scalar_type() == at::kInt),
                 "dtype of x should be bfloat16, float16, dtype of topk_ids should be int.");
 
+    const bool packedWeights = !weight1.empty() && weight1[0].dim() == 3;
+    if (commAlg == "local_partial_tp4" && packedWeights) {
+        constexpr int64_t localExperts = 64, hidden = 2048, intermediate = 512;
+        TORCH_CHECK(weight1.size() == 1 && weight2.size() == 1 &&
+                        weight1[0].scalar_type() == at::kBFloat16 &&
+                        weight2[0].scalar_type() == at::kBFloat16 &&
+                        weight1[0].sizes() == at::IntArrayRef({localExperts, hidden, 2 * intermediate}) &&
+                        weight2[0].sizes() == at::IntArrayRef({localExperts, intermediate, hidden}) &&
+                        weight1[0].is_contiguous() && weight2[0].is_contiguous() &&
+                        !weight1Type.has_value() && !weight2Type.has_value(),
+                    "Packed local_partial_tp4 requires contiguous BF16 ND weights "
+                    "[64,2048,1024] and [64,512,2048], one tensor per layer, without dtype overrides");
+    }
+
     at::TensorList weight1Ref = weight1;
     at::TensorList weight2Ref = weight2;
 
