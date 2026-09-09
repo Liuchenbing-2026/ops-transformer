@@ -1515,12 +1515,15 @@ private:
             shmem.CrossRankSync(ctrBuffer);
         }
 
-        // KernelMoeTokenUnpermute uses get_block_num() (= AIC tile count), not full AIV count.
-        // Use coreNum/2 for tiling and run only on one subblock to match blockIdx/blockNum semantics.
-        if (get_subblockid() == 1) {
+        // Local partials are independent output rows. Use both vector subblocks
+        // when every core can receive at least one row; the existing tiler
+        // requires a nonzero tokens_core_length. Other layouts keep 20 cores.
+        const bool useAllUnpermuteCores = params.localPartial && params.problemShape.m() >= coreNum;
+        if (useAllUnpermuteCores || get_subblockid() == 1) {
             exceptionDump_.UpdateStage(MC2MegaMoeAdump::Stage::UNPERMUTE);
             MoeTokenUnpermuteTilingData tilingData;
-            MoeTokenUnpermuteTiling(params.problemShape.m() * params.topK, n2, params.topK, tilingData, coreNum / 2);
+            MoeTokenUnpermuteTiling(params.problemShape.m() * params.topK, n2, params.topK, tilingData,
+                                   useAllUnpermuteCores ? coreNum : coreNum / 2);
             KernelMoeTokenUnpermute<ElementD2, int32_t, float, true> kernelMoeTokenUnpermuteOp;
             const uint64_t outputRow = params.replicatedDispatch ? rank * params.problemShape.m() : 0;
             const uint64_t indexOffset = params.replicatedDispatch ?
@@ -1529,7 +1532,7 @@ private:
                                            workspaceInfo.expandedRowIdx + indexOffset,
                                            params.probs + outputRow * params.topK * sizeof(float),
                                            reinterpret_cast<GM_ADDR>(params.ptrOutput) +
-                                               outputRow * n2 * sizeof(ElementD2), &tilingData);
+                                               outputRow * n2 * sizeof(ElementD2), &tilingData, useAllUnpermuteCores);
             kernelMoeTokenUnpermuteOp.Process();
         }
     }
