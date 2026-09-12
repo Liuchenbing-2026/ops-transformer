@@ -1524,16 +1524,24 @@ private:
             MoeTokenUnpermuteTilingData tilingData;
             MoeTokenUnpermuteTiling(params.problemShape.m() * params.topK, n2, params.topK, tilingData,
                                    useAllUnpermuteCores ? coreNum : coreNum / 2);
-            KernelMoeTokenUnpermute<ElementD2, int32_t, float, true> kernelMoeTokenUnpermuteOp;
-            const uint64_t outputRow = params.replicatedDispatch ? rank * params.problemShape.m() : 0;
-            const uint64_t indexOffset = params.replicatedDispatch ?
-                rank * AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t) : 0;
-            kernelMoeTokenUnpermuteOp.Init(shmem() + peermemInfo.offsetD,
-                                           workspaceInfo.expandedRowIdx + indexOffset,
-                                           params.probs + outputRow * params.topK * sizeof(float),
-                                           reinterpret_cast<GM_ADDR>(params.ptrOutput) +
-                                               outputRow * n2 * sizeof(ElementD2), &tilingData, useAllUnpermuteCores);
-            kernelMoeTokenUnpermuteOp.Process();
+            if (params.localPartial) {
+                KernelMoeTokenUnpermute<ElementD2, int32_t, float, true, true> localUnpermute;
+                localUnpermute.Init(shmem() + peermemInfo.offsetD, workspaceInfo.expandedRowIdx,
+                                    params.probs, reinterpret_cast<GM_ADDR>(params.ptrOutput),
+                                    &tilingData, useAllUnpermuteCores, localRowBegin, localRowEnd);
+                localUnpermute.Process();
+            } else {
+                KernelMoeTokenUnpermute<ElementD2, int32_t, float, true> kernelMoeTokenUnpermuteOp;
+                const uint64_t outputRow = params.replicatedDispatch ? rank * params.problemShape.m() : 0;
+                const uint64_t indexOffset = params.replicatedDispatch ?
+                    rank * AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t) : 0;
+                kernelMoeTokenUnpermuteOp.Init(shmem() + peermemInfo.offsetD,
+                                               workspaceInfo.expandedRowIdx + indexOffset,
+                                               params.probs + outputRow * params.topK * sizeof(float),
+                                               reinterpret_cast<GM_ADDR>(params.ptrOutput) +
+                                                   outputRow * n2 * sizeof(ElementD2), &tilingData, useAllUnpermuteCores);
+                kernelMoeTokenUnpermuteOp.Process();
+            }
         }
     }
 
@@ -1578,39 +1586,14 @@ private:
         AscendC::SyncAll<true>();
 
         const uint32_t rank = RuntimeRank(params);
-        const int32_t firstRow = preSumBeforeRankForDispatch(rank * params.expertPerRank);
-        int32_t lastRow = firstRow;
+        // Preserve the local interval in scalar members before the common tail
+        // resets tokenPerExpert. Unpermute can reject foreign rows directly:
+        // rewriting every expanded index and synchronizing all AIVs is redundant.
+        localRowBegin = preSumBeforeRankForDispatch(rank * params.expertPerRank);
+        localRowEnd = localRowBegin;
         for (uint32_t expert = 0; expert < params.expertPerRank; ++expert) {
-            lastRow += tokenPerExpert(tokenPerExpertLayout(rank, rank, expert));
+            localRowEnd += tokenPerExpert(tokenPerExpertLayout(rank, rank, expert));
         }
-        const uint32_t slots = params.problemShape.m() * params.topK;
-        constexpr uint32_t indexChunk = 1024;
-        AscendC::GlobalTensor<int32_t> indices;
-        indices.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(workspaceInfo.expandedRowIdx));
-        AscendC::LocalTensor<int32_t> local = resource.ubBuf.template GetBufferByByte<int32_t>(0);
-        // Whole 32-byte index groups have a single writer. The only tail uses
-        // DataCopyPad. Use a nonnegative out-of-range index, as unpermute tests
-        // index < num_out_tokens and does not accept a negative sentinel.
-        for (uint32_t start = coreIdx * indexChunk; start < slots; start += coreNum * indexChunk) {
-            const uint32_t count = min(indexChunk, slots - start);
-            AscendC::DataCopyPad(local, indices[start],
-                AscendC::DataCopyExtParams{1, count * static_cast<uint32_t>(sizeof(int32_t)), 0, 0, 0},
-                AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-            for (uint32_t i = 0; i < count; ++i) {
-                if (local(i) < firstRow || local(i) >= lastRow) {
-                    local(i) = slots;
-                }
-            }
-            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
-            AscendC::DataCopyPad(indices[start], local,
-                AscendC::DataCopyExtParams{1, count * static_cast<uint32_t>(sizeof(int32_t)), 0, 0, 0});
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-        }
-        AscendC::SyncAll<true>();
     }
 
     CATLASS_DEVICE
@@ -1979,6 +1962,8 @@ private:
 
     uint32_t coreIdx;
     uint32_t coreNum;
+    int32_t localRowBegin{0};
+    int32_t localRowEnd{0};
     uint32_t serverId_ = 0;
 
     WorkspaceInfo workspaceInfo;
