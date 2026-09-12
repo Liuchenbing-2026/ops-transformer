@@ -31,3 +31,5 @@ V30 将本卡行范围判断放入 unpermute，省去 expandedRowIdx 的一次�
 最新单算子复测的 8192 tokens 四卡瓶颈设备区间约快 9.4%，但含准备和最终 AllReduce 的独立调用仍慢约 7.3%。这两个范围不同，详见统一报告，不能写成单算子全面加速。
 
 算子精度包含此前 56 项 case/rank 边界用例，以及最新同版 48 项普通计时用例；均检查 BF16 逐位一致。框架固定请求和重复稳定性检查也通过。这些有限用例不是全模型、全输入无损的证明。
+
+用户指定新机器的 TP4/EP4 BF16 整网复现，见 [112.29.145.3 复现报告](https://github.com/Liuchenbing-2026/vllm-ascend/blob/codex/megamoe-bf16-eval-20260907/docs/source/developer_guide/performance_and_debug/megamoe_bf16_112_reproduction.md)。新机器 4K/6K 平均吞吐变化分别为 -0.038% / -1.277%。本次没有复现出稳定吞吐收益，18 机的收益不能承诺跨机器成立。报告包含独立原始数据、精度结果、输入包，以及可编辑源码和压测客户端环境的换机要求。算子源码未因这次迁移改变。
